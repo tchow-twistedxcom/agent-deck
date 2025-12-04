@@ -1078,6 +1078,19 @@ func (s *Session) ResetAcknowledged() {
 	s.lastStableStatus = "waiting"
 }
 
+// SignalFileActivity signals that file output was detected (from LogWatcher)
+// This directly triggers GREEN status by updating the cooldown timer
+// Call this when pipe-pane log file is written to
+func (s *Session) SignalFileActivity() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.ensureStateTrackerLocked()
+	s.stateTracker.lastChangeTime = time.Now()
+	s.stateTracker.acknowledged = false
+	s.lastStableStatus = "active"
+}
+
 // hasBusyIndicator checks if the terminal shows explicit busy indicators
 // This is a quick check used in GetStatus() to detect active processing
 //

@@ -149,12 +149,15 @@ func NewHome() *Home {
 
 	// Initialize event-driven log watcher
 	logWatcher, err := tmux.NewLogWatcher(tmux.LogDir(), func(sessionName string) {
-		// Find session by tmux name and trigger status update
+		// Find session by tmux name and signal file activity
 		h.instancesMu.RLock()
 		for _, inst := range h.instances {
 			if inst.GetTmuxSession() != nil && inst.GetTmuxSession().Name == sessionName {
-				// Trigger status update for this specific session
+				// Signal file activity (triggers GREEN) then update status
 				go func(i *session.Instance) {
+					if tmuxSess := i.GetTmuxSession(); tmuxSess != nil {
+						tmuxSess.SignalFileActivity() // Directly triggers GREEN
+					}
 					_ = i.UpdateStatus()
 				}(inst)
 				break
