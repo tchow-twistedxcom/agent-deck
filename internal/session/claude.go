@@ -1,11 +1,13 @@
 package session
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -129,4 +131,124 @@ func findActiveSessionID(configDir, projectPath string) string {
 	}
 
 	return ""
+}
+
+// FindSessionForInstance finds the session file for a specific instance
+// Parameters:
+//   - projectPath: the project directory
+//   - createdAfter: only consider files with internal timestamp >= this time
+//   - excludeIDs: session IDs already claimed by other instances
+// Returns the session ID or empty string if not found
+func FindSessionForInstance(projectPath string, createdAfter time.Time, excludeIDs map[string]bool) string {
+	configDir := GetClaudeConfigDir()
+
+	// Convert project path to Claude's directory format
+	// /Users/ashesh/claude-deck -> -Users-ashesh-claude-deck
+	projectDirName := strings.ReplaceAll(projectPath, "/", "-")
+	projectDir := filepath.Join(configDir, "projects", projectDirName)
+
+	// Check if project directory exists
+	if _, err := os.Stat(projectDir); os.IsNotExist(err) {
+		return ""
+	}
+
+	// Find all UUID-named session files
+	files, err := filepath.Glob(filepath.Join(projectDir, "*.jsonl"))
+	if err != nil || len(files) == 0 {
+		return ""
+	}
+
+	// UUID pattern for session files
+	uuidPattern := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$`)
+
+	type candidate struct {
+		sessionID string
+		timestamp time.Time
+	}
+	var candidates []candidate
+
+	for _, file := range files {
+		base := filepath.Base(file)
+
+		// Skip agent files
+		if strings.HasPrefix(base, "agent-") {
+			continue
+		}
+
+		// Only UUID-named files
+		if !uuidPattern.MatchString(base) {
+			continue
+		}
+
+		sessionID := strings.TrimSuffix(base, ".jsonl")
+
+		// Skip if already claimed
+		if excludeIDs[sessionID] {
+			continue
+		}
+
+		// Get internal timestamp from file
+		ts := getFileInternalTimestamp(file)
+		if ts.IsZero() {
+			continue
+		}
+
+		// Only consider files created after our session start
+		if ts.Before(createdAfter) {
+			continue
+		}
+
+		candidates = append(candidates, candidate{sessionID: sessionID, timestamp: ts})
+	}
+
+	if len(candidates) == 0 {
+		return ""
+	}
+
+	// Sort by timestamp (earliest first) and return the first one
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].timestamp.Before(candidates[j].timestamp)
+	})
+
+	return candidates[0].sessionID
+}
+
+// getFileInternalTimestamp reads the first line of a session file and extracts the timestamp
+func getFileInternalTimestamp(filePath string) time.Time {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return time.Time{}
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	if !scanner.Scan() {
+		return time.Time{}
+	}
+
+	line := scanner.Text()
+
+	// Parse JSON to get timestamp field
+	var data struct {
+		Timestamp string `json:"timestamp"`
+	}
+	if err := json.Unmarshal([]byte(line), &data); err != nil {
+		return time.Time{}
+	}
+
+	if data.Timestamp == "" {
+		return time.Time{}
+	}
+
+	// Parse ISO 8601 timestamp
+	ts, err := time.Parse(time.RFC3339, data.Timestamp)
+	if err != nil {
+		// Try parsing with milliseconds
+		ts, err = time.Parse("2006-01-02T15:04:05.999Z", data.Timestamp)
+		if err != nil {
+			return time.Time{}
+		}
+	}
+
+	return ts
 }
