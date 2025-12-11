@@ -61,7 +61,6 @@ func NewInstanceWithGroup(title, projectPath, groupPath string) *Instance {
 }
 
 // NewInstanceWithTool creates a new session with tool-specific initialization
-// When tool is "claude", pre-assigns a ClaudeSessionID for reliable fork support
 func NewInstanceWithTool(title, projectPath, tool string) *Instance {
 	inst := &Instance{
 		ID:          generateID(),
@@ -74,12 +73,8 @@ func NewInstanceWithTool(title, projectPath, tool string) *Instance {
 		tmuxSession: tmux.NewSession(title, projectPath),
 	}
 
-	// Pre-assign Claude session ID if tool is claude
-	// This ensures reliable fork functionality by knowing the session ID upfront
-	if tool == "claude" {
-		inst.ClaudeSessionID = generateUUID()
-		inst.ClaudeDetectedAt = time.Now()
-	}
+	// Claude session ID will be detected from files Claude creates
+	// No pre-assignment needed
 
 	return inst
 }
@@ -117,28 +112,22 @@ func extractGroupPath(projectPath string) string {
 	return DefaultGroupName
 }
 
-// buildClaudeCommand builds the claude command with --session-id if available
-// This ensures reliable session tracking for fork functionality
+// buildClaudeCommand builds the claude command with config dir and permissions flag
+// NOTE: --session-id is NOT used as it creates a useless summary file instead of
+// controlling the actual session UUID. We detect the session ID from files Claude creates.
 func (i *Instance) buildClaudeCommand(baseCommand string) string {
-	if i.Tool != "claude" || i.ClaudeSessionID == "" {
+	if i.Tool != "claude" {
 		return baseCommand
 	}
 
 	configDir := GetClaudeConfigDir()
 
-	// If baseCommand is just "claude", build full command with session ID
+	// If baseCommand is just "claude", build full command with config dir
 	if baseCommand == "claude" {
-		return fmt.Sprintf("CLAUDE_CONFIG_DIR=%s claude --session-id %s --dangerously-skip-permissions",
-			configDir, i.ClaudeSessionID)
+		return fmt.Sprintf("CLAUDE_CONFIG_DIR=%s claude --dangerously-skip-permissions", configDir)
 	}
 
-	// If it's a custom claude command, inject --session-id after "claude"
-	if strings.Contains(baseCommand, "claude") && !strings.Contains(baseCommand, "--session-id") {
-		// Find "claude" and insert --session-id right after
-		return strings.Replace(baseCommand, "claude ",
-			fmt.Sprintf("claude --session-id %s ", i.ClaudeSessionID), 1)
-	}
-
+	// For custom commands, return as-is (config dir set via environment)
 	return baseCommand
 }
 
@@ -148,11 +137,8 @@ func (i *Instance) Start() error {
 		return fmt.Errorf("tmux session not initialized")
 	}
 
-	// Build command with session ID if claude
-	command := i.Command
-	if i.Tool == "claude" && i.ClaudeSessionID != "" {
-		command = i.buildClaudeCommand(i.Command)
-	}
+	// Build command (adds config dir for claude)
+	command := i.buildClaudeCommand(i.Command)
 
 	// Start the tmux session
 	if err := i.tmuxSession.Start(command); err != nil {
@@ -210,27 +196,12 @@ func (i *Instance) UpdateStatus() error {
 }
 
 // UpdateClaudeSession updates the Claude session ID if Claude is running
-// For sessions with pre-assigned IDs (via --session-id flag), just refresh the timestamp
-// For forked sessions and legacy sessions, use detection to find the session ID
+// Uses detection to find the session ID from files Claude creates
 func (i *Instance) UpdateClaudeSession() {
 	// Only track if tool is Claude
 	if i.Tool != "claude" {
 		return
 	}
-
-	// Check if this is a NEW session with pre-assigned ID (not a fork or legacy session)
-	// Pre-assigned sessions have --session-id in their command
-	isPREAssigned := i.ClaudeSessionID != "" && strings.Contains(i.Command, "--session-id")
-
-	if isPREAssigned {
-		// This is the bulletproof path - we know the ID upfront, no detection needed
-		i.ClaudeDetectedAt = time.Now()
-		return
-	}
-
-	// DETECTION PATH: For forked sessions and legacy sessions
-	// Forked sessions use --resume --fork-session (no --session-id)
-	// Legacy sessions were created before the --session-id feature
 
 	// Get the session's working directory
 	if i.tmuxSession == nil {
