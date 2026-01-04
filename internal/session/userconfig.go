@@ -123,6 +123,10 @@ type ClaudeSettings struct {
 	// DangerousMode enables --dangerously-skip-permissions flag for Claude sessions
 	// Default: false
 	DangerousMode bool `toml:"dangerous_mode"`
+
+	// ExtraArgs are additional command-line arguments to pass to Claude
+	// Example: ["--chrome", "--verbose"]
+	ExtraArgs []string `toml:"extra_args"`
 }
 
 // GlobalSearchSettings defines global conversation search configuration
@@ -413,6 +417,8 @@ func CreateExampleConfig() error {
 # Default: ~/.claude (or CLAUDE_CONFIG_DIR env var takes priority)
 # [claude]
 # config_dir = "~/.claude-work"
+# dangerous_mode = true                    # Enable --dangerously-skip-permissions
+# extra_args = ["--chrome", "--verbose"]   # Additional CLI arguments for Claude
 
 # Log file management
 # Agent-deck logs session output to ~/.agent-deck/logs/ for status detection
