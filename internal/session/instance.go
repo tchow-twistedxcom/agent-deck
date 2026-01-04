@@ -198,34 +198,46 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 		configDirPrefix = fmt.Sprintf("CLAUDE_CONFIG_DIR=%s ", configDir)
 	}
 
-	// Check if dangerous mode is enabled in user config
+	// Load user config for dangerous mode and extra args
 	dangerousMode := false
+	var extraArgs []string
 	if userConfig, err := LoadUserConfig(); err == nil && userConfig != nil {
 		dangerousMode = userConfig.Claude.DangerousMode
+		extraArgs = userConfig.Claude.ExtraArgs
+	}
+
+	// Build extra flags string (dangerous mode + extra args)
+	buildExtraFlags := func() string {
+		var flags string
+		if dangerousMode {
+			flags += " --dangerously-skip-permissions"
+		}
+		for _, arg := range extraArgs {
+			flags += " " + arg
+		}
+		return flags
 	}
 
 	// If baseCommand is just "claude", build the capture-resume command
 	// This command:
 	// 1. Starts Claude in print mode to get session ID
 	// 2. Stores session ID in tmux environment (for retrieval by agent-deck)
-	// 3. Resumes that session interactively (with dangerous mode if enabled)
+	// 3. Resumes that session interactively (with dangerous mode and extra args if configured)
 	// 4. Optionally waits for prompt and sends initial message
 	if baseCommand == "claude" {
+		extraFlags := buildExtraFlags()
+
 		var baseCmd string
 		// Build command with fallback: try session capture, but start Claude anyway if capture fails
 		// This handles cases where: Claude isn't authenticated, jq isn't installed, JSON parse fails
 		// Fallback ensures Claude starts (without fork/restart support) rather than failing completely
-		dangerousFlag := ""
-		if dangerousMode {
-			dangerousFlag = " --dangerously-skip-permissions"
-		}
 		baseCmd = fmt.Sprintf(
 			`session_id=$(%sclaude -p "." --output-format json 2>/dev/null | jq -r '.session_id' 2>/dev/null) || session_id=""; `+
 				`if [ -n "$session_id" ] && [ "$session_id" != "null" ]; then `+
 				`tmux set-environment CLAUDE_SESSION_ID "$session_id"; `+
 				`%sclaude --resume "$session_id"%s; `+
 				`else %sclaude%s; fi`,
-			configDirPrefix, configDirPrefix, dangerousFlag, configDirPrefix, dangerousFlag)
+			configDirPrefix, configDirPrefix, extraFlags, configDirPrefix, extraFlags)
 
 		// If message provided, append wait-and-send logic
 		if message != "" {
@@ -243,7 +255,7 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 					`tmux set-environment CLAUDE_SESSION_ID "$session_id"; `+
 					`%sclaude --resume "$session_id"%s; `+
 					`else %sclaude%s; fi`,
-				configDirPrefix, escapedMsg, configDirPrefix, dangerousFlag, configDirPrefix, dangerousFlag)
+				configDirPrefix, escapedMsg, configDirPrefix, extraFlags, configDirPrefix, extraFlags)
 		}
 
 		return baseCmd
@@ -1100,7 +1112,7 @@ func (i *Instance) Restart() error {
 }
 
 // buildClaudeResumeCommand builds the claude resume command with proper config options
-// Respects: CLAUDE_CONFIG_DIR, dangerous_mode from user config
+// Respects: CLAUDE_CONFIG_DIR, dangerous_mode, extra_args from user config
 // IMPORTANT: Also sets CLAUDE_SESSION_ID in tmux environment so detection works after restart
 func (i *Instance) buildClaudeResumeCommand() string {
 	// Check if CLAUDE_CONFIG_DIR is explicitly configured
@@ -1111,21 +1123,28 @@ func (i *Instance) buildClaudeResumeCommand() string {
 		configDirPrefix = fmt.Sprintf("CLAUDE_CONFIG_DIR=%s ", configDir)
 	}
 
-	// Check if dangerous mode is enabled in user config
+	// Load user config for dangerous mode and extra args
 	dangerousMode := false
+	var extraArgs []string
 	if userConfig, err := LoadUserConfig(); err == nil && userConfig != nil {
 		dangerousMode = userConfig.Claude.DangerousMode
+		extraArgs = userConfig.Claude.ExtraArgs
+	}
+
+	// Build extra flags string
+	var extraFlags string
+	if dangerousMode {
+		extraFlags += " --dangerously-skip-permissions"
+	}
+	for _, arg := range extraArgs {
+		extraFlags += " " + arg
 	}
 
 	// Build the command with tmux environment update
 	// This ensures CLAUDE_SESSION_ID is set in tmux env after restart,
 	// so GetSessionIDFromTmux() works correctly and detects the session
-	if dangerousMode {
-		return fmt.Sprintf("tmux set-environment CLAUDE_SESSION_ID %s && %sclaude --resume %s --dangerously-skip-permissions",
-			i.ClaudeSessionID, configDirPrefix, i.ClaudeSessionID)
-	}
-	return fmt.Sprintf("tmux set-environment CLAUDE_SESSION_ID %s && %sclaude --resume %s",
-		i.ClaudeSessionID, configDirPrefix, i.ClaudeSessionID)
+	return fmt.Sprintf("tmux set-environment CLAUDE_SESSION_ID %s && %sclaude --resume %s%s",
+		i.ClaudeSessionID, configDirPrefix, i.ClaudeSessionID, extraFlags)
 }
 
 // CanRestart returns true if the session can be restarted
