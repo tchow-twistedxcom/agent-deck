@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, custom/extra-args, 'feature/*']
+    branches: [main, custom/dev, 'feature/*']
   pull_request:
-    branches: [main, custom/extra-args]
+    branches: [main, custom/dev]
 
 jobs:
   test:
