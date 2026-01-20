@@ -3255,6 +3255,10 @@ func (h *Home) createSessionFromGlobalSearch(result *GlobalSearchResult) tea.Cmd
 		// Build resume command with config dir and permission flags
 		userConfig, _ := session.LoadUserConfig()
 		opts := session.NewClaudeOptions(userConfig)
+		var extraArgs []string
+		if userConfig != nil {
+			extraArgs = userConfig.Claude.ExtraArgs
+		}
 
 		// Build command - only set CLAUDE_CONFIG_DIR if explicitly configured
 		// If not explicit, let the tmux shell's environment handle it
@@ -3271,6 +3275,10 @@ func (h *Home) createSessionFromGlobalSearch(result *GlobalSearchResult) tea.Cmd
 			cmdBuilder.WriteString(" --dangerously-skip-permissions")
 		} else if opts.AllowSkipPermissions {
 			cmdBuilder.WriteString(" --allow-dangerously-skip-permissions")
+		}
+		for _, arg := range extraArgs {
+			cmdBuilder.WriteString(" ")
+			cmdBuilder.WriteString(arg)
 		}
 		inst.Command = cmdBuilder.String()
 
