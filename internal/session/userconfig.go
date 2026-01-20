@@ -336,6 +336,10 @@ type ClaudeSettings struct {
 	// Power users typically want this enabled for faster iteration
 	DangerousMode *bool `toml:"dangerous_mode"`
 
+	// ExtraArgs are additional command-line arguments to pass to Claude
+	// Example: ["--chrome", "--verbose"]
+	ExtraArgs []string `toml:"extra_args"`
+
 	// EnvFile is a .env file specific to Claude sessions
 	// Sourced AFTER global [shell].env_files
 	// Path can be absolute, ~ for home, or relative to session working directory

@@ -2874,11 +2874,13 @@ func (h *Home) createSessionFromGlobalSearch(result *GlobalSearchResult) tea.Cmd
 		inst := session.NewInstanceWithGroupAndTool(title, projectPath, h.getCurrentGroupPath(), "claude")
 		inst.ClaudeSessionID = result.SessionID
 
-		// Build resume command with config dir and dangerous mode
+		// Build resume command with config dir, dangerous mode, and extra args
 		userConfig, _ := session.LoadUserConfig()
 		dangerousMode := false
+		var extraArgs []string
 		if userConfig != nil {
 			dangerousMode = userConfig.Claude.GetDangerousMode()
+			extraArgs = userConfig.Claude.ExtraArgs
 		}
 
 		// Build command - only set CLAUDE_CONFIG_DIR if explicitly configured
@@ -2894,6 +2896,10 @@ func (h *Home) createSessionFromGlobalSearch(result *GlobalSearchResult) tea.Cmd
 		cmdBuilder.WriteString(result.SessionID)
 		if dangerousMode {
 			cmdBuilder.WriteString(" --dangerously-skip-permissions")
+		}
+		for _, arg := range extraArgs {
+			cmdBuilder.WriteString(" ")
+			cmdBuilder.WriteString(arg)
 		}
 		inst.Command = cmdBuilder.String()
 
