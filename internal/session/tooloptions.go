@@ -93,6 +93,12 @@ func NewClaudeOptions(config *UserConfig) *ClaudeOptions {
 	if config != nil {
 		opts.SkipPermissions = config.Claude.GetDangerousMode()
 		opts.AllowSkipPermissions = config.Claude.AllowDangerousMode
+		// Parse ExtraArgs for known flags
+		for _, arg := range config.Claude.ExtraArgs {
+			if arg == "--chrome" {
+				opts.UseChrome = true
+			}
+		}
 	}
 	return opts
 }
