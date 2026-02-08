@@ -94,6 +94,9 @@ type InstanceData struct {
 	CodexSessionID  string    `json:"codex_session_id,omitempty"`
 	CodexDetectedAt time.Time `json:"codex_detected_at,omitempty"`
 
+	// Beads integration
+	BeadID string `json:"bead_id,omitempty"`
+
 	// Latest user input for context
 	LatestPrompt string `json:"latest_prompt,omitempty"`
 
@@ -253,6 +256,7 @@ func (s *Storage) SaveWithGroups(instances []*Instance, groupTree *GroupTree) er
 			inst.CodexSessionID, inst.CodexDetectedAt,
 			inst.LatestPrompt, inst.LoadedMCPNames,
 			inst.ToolOptionsJSON,
+			inst.BeadID,
 		)
 
 		rows[i] = &statedb.InstanceRow{
@@ -392,7 +396,7 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			opencodeSID, opencodeAt,
 			codexSID, codexAt,
 			latestPrompt, loadedMCPs,
-			toolOpts := statedb.UnmarshalToolData(r.ToolData)
+			toolOpts, beadID := statedb.UnmarshalToolData(r.ToolData)
 
 		instances[i] = &InstanceData{
 			ID:                 r.ID,
@@ -424,6 +428,7 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			LatestPrompt:       latestPrompt,
 			ToolOptionsJSON:    toolOpts,
 			LoadedMCPNames:     loadedMCPs,
+			BeadID:             beadID,
 		}
 	}
 
@@ -474,7 +479,7 @@ func (s *Storage) LoadWithGroups() ([]*Instance, []*GroupData, error) {
 			opencodeSID, opencodeAt,
 			codexSID, codexAt,
 			latestPrompt, loadedMCPs,
-			toolOpts := statedb.UnmarshalToolData(r.ToolData)
+			toolOpts, beadID := statedb.UnmarshalToolData(r.ToolData)
 
 		data.Instances[i] = &InstanceData{
 			ID:                 r.ID,
@@ -506,6 +511,7 @@ func (s *Storage) LoadWithGroups() ([]*Instance, []*GroupData, error) {
 			LatestPrompt:       latestPrompt,
 			ToolOptionsJSON:    toolOpts,
 			LoadedMCPNames:     loadedMCPs,
+			BeadID:             beadID,
 		}
 	}
 
@@ -659,6 +665,7 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			CodexSessionID:     instData.CodexSessionID,
 			CodexDetectedAt:    instData.CodexDetectedAt,
 			ToolOptionsJSON:    instData.ToolOptionsJSON,
+			BeadID:             instData.BeadID,
 			LatestPrompt:       instData.LatestPrompt,
 			LoadedMCPNames:     instData.LoadedMCPNames,
 			tmuxSession:        tmuxSess,

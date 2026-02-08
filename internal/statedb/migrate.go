@@ -77,6 +77,7 @@ type toolDataBlob struct {
 	LatestPrompt       string          `json:"latest_prompt,omitempty"`
 	LoadedMCPNames     []string        `json:"loaded_mcp_names,omitempty"`
 	ToolOptions        json.RawMessage `json:"tool_options,omitempty"`
+	BeadID             string          `json:"bead_id,omitempty"`
 }
 
 // MigrateFromJSON reads a sessions.json file and inserts all data into the StateDB.
@@ -180,6 +181,7 @@ func MarshalToolData(
 	codexSessionID string, codexDetectedAt time.Time,
 	latestPrompt string, loadedMCPNames []string,
 	toolOptionsJSON json.RawMessage,
+	beadID string,
 ) json.RawMessage {
 	td := toolDataBlob{
 		ClaudeSessionID:   claudeSessionID,
@@ -191,6 +193,7 @@ func MarshalToolData(
 		LatestPrompt:      latestPrompt,
 		LoadedMCPNames:    loadedMCPNames,
 		ToolOptions:       toolOptionsJSON,
+		BeadID:            beadID,
 	}
 	if !claudeDetectedAt.IsZero() {
 		td.ClaudeDetectedAt = claudeDetectedAt.Unix()
@@ -218,6 +221,7 @@ func UnmarshalToolData(data json.RawMessage) (
 	codexSessionID string, codexDetectedAt time.Time,
 	latestPrompt string, loadedMCPNames []string,
 	toolOptionsJSON json.RawMessage,
+	beadID string,
 ) {
 	if len(data) == 0 {
 		return
@@ -247,5 +251,6 @@ func UnmarshalToolData(data json.RawMessage) (
 	latestPrompt = td.LatestPrompt
 	loadedMCPNames = td.LoadedMCPNames
 	toolOptionsJSON = td.ToolOptions
+	beadID = td.BeadID
 	return
 }
