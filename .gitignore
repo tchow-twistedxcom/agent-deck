@@ -48,3 +48,6 @@ Thumbs.db
 
 .worktrees
 agent-deck-test
+
+# bv (beads viewer) local config and caches
+.bv/

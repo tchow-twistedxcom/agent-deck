@@ -21,6 +21,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
 
+	"github.com/asheshgoplani/agent-deck/internal/beads"
 	"github.com/asheshgoplani/agent-deck/internal/clipboard"
 	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
@@ -151,6 +152,7 @@ type Home struct {
 	geminiModelDialog    *GeminiModelDialog    // For selecting Gemini model
 	sessionPickerDialog  *SessionPickerDialog  // For sending output to another session
 	worktreeFinishDialog *WorktreeFinishDialog // For finishing worktree sessions (merge + cleanup)
+	beadsPanel           *BeadsPanel           // For viewing and managing beads (tasks)
 
 	// Analytics cache (async fetching with TTL)
 	currentAnalytics       *session.SessionAnalytics                  // Current analytics for selected session (Claude)
@@ -513,6 +515,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		geminiModelDialog:    NewGeminiModelDialog(),
 		sessionPickerDialog:  NewSessionPickerDialog(),
 		worktreeFinishDialog: NewWorktreeFinishDialog(),
+		beadsPanel:           NewBeadsPanel(),
 		cursor:               0,
 		initialLoading:       true, // Show splash until sessions load
 		ctx:                  ctx,
@@ -2009,6 +2012,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.setupWizard.SetSize(msg.Width, msg.Height)
 		h.settingsPanel.SetSize(msg.Width, msg.Height)
 		h.geminiModelDialog.SetSize(msg.Width, msg.Height)
+		h.beadsPanel.SetSize(msg.Width, msg.Height)
 		return h, nil
 
 	case loadSessionsMsg:
@@ -2528,6 +2532,15 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case modelsFetchedMsg:
 		if h.geminiModelDialog != nil && h.geminiModelDialog.IsVisible() {
 			h.geminiModelDialog.HandleModelsFetched(msg)
+		}
+		return h, nil
+
+	case beadsLoadedMsg, beadClaimedMsg, beadClosedMsg:
+		// Route beads messages to the beads panel
+		if h.beadsPanel.IsVisible() {
+			var cmd tea.Cmd
+			h.beadsPanel, cmd = h.beadsPanel.Update(msg)
+			return h, cmd
 		}
 		return h, nil
 
@@ -3119,6 +3132,9 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if h.worktreeFinishDialog.IsVisible() {
 			return h.handleWorktreeFinishDialogKey(msg)
+		}
+		if h.beadsPanel.IsVisible() {
+			return h.handleBeadsPanelKey(msg)
 		}
 
 		// Main view keys
@@ -3736,6 +3752,22 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					dirty, err := git.HasUncommittedChanges(wtPath)
 					return worktreeDirtyCheckMsg{sessionID: sid, isDirty: dirty, err: err}
 				}
+			}
+		}
+		return h, nil
+
+	case "b":
+		// Beads panel - show tasks for selected session's project
+		if h.cursor < len(h.flatItems) {
+			item := h.flatItems[h.cursor]
+			if item.Type == session.ItemTypeSession && item.Session != nil && item.Session.ProjectPath != "" {
+				// Check if beads is installed
+				if !beads.IsInstalled() {
+					h.setError(fmt.Errorf("beads CLI (bd) not installed. Install with: curl -sSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash"))
+					return h, nil
+				}
+				h.beadsPanel.SetSize(h.width, h.height)
+				return h, h.beadsPanel.Show(item.Session.ProjectPath)
 			}
 		}
 		return h, nil
@@ -5375,6 +5407,9 @@ func (h *Home) View() string {
 	}
 	if h.worktreeFinishDialog.IsVisible() {
 		return h.worktreeFinishDialog.View()
+	}
+	if h.beadsPanel.IsVisible() {
+		return h.beadsPanel.View()
 	}
 
 	// Reuse viewBuilder to reduce allocations (reset and pre-allocate)
@@ -8395,6 +8430,45 @@ func (h *Home) finishWorktree(inst *session.Instance, sessionID, sessionTitle, b
 			targetBranch: targetBranch,
 			merged:       merged,
 		}
+	}
+}
+
+// handleBeadsPanelKey handles keys when beads panel is visible
+func (h *Home) handleBeadsPanelKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		// Link selected bead to currently selected session
+		if bead := h.beadsPanel.GetSelectedBead(); bead != nil {
+			// Link to the currently selected session (if it's in the same project)
+			if selected := h.getSelectedSession(); selected != nil {
+				if selected.ProjectPath == h.beadsPanel.GetProjectPath() {
+					selected.BeadID = bead.ID
+					// Trigger a save with the updated instance
+					if h.storage != nil {
+						h.instancesMu.RLock()
+						instancesCopy := make([]*session.Instance, len(h.instances))
+						copy(instancesCopy, h.instances)
+						h.instancesMu.RUnlock()
+						groupTreeCopy := h.groupTree.ShallowCopyForSave()
+						if h.storageWatcher != nil {
+							h.storageWatcher.NotifySave()
+						}
+						if err := h.storage.SaveWithGroups(instancesCopy, groupTreeCopy); err != nil {
+							h.setError(err)
+						}
+					}
+				}
+			}
+		}
+		h.beadsPanel.Hide()
+		return h, nil
+	case "esc", "b", "q":
+		h.beadsPanel.Hide()
+		return h, nil
+	default:
+		var cmd tea.Cmd
+		h.beadsPanel, cmd = h.beadsPanel.Update(msg)
+		return h, cmd
 	}
 }
 
