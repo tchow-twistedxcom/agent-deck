@@ -3772,6 +3772,21 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case "V", "shift+v":
+		// Launch beads viewer (bv) in tmux split
+		if h.cursor < len(h.flatItems) {
+			item := h.flatItems[h.cursor]
+			if item.Type == session.ItemTypeSession && item.Session != nil && item.Session.ProjectPath != "" {
+				// Check if bv is installed
+				if _, err := exec.LookPath("bv"); err != nil {
+					h.setError(fmt.Errorf("beads viewer (bv) not installed. Install with: brew install dicklesworthstone/tap/bv"))
+					return h, nil
+				}
+				return h, h.launchBeadsViewer(item.Session)
+			}
+		}
+		return h, nil
+
 	case "g":
 		// Vi-style gg to jump to top (#38) - check for double-tap first
 		if time.Since(h.lastGTime) < 500*time.Millisecond {
@@ -8469,6 +8484,15 @@ func (h *Home) handleBeadsPanelKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		h.beadsPanel, cmd = h.beadsPanel.Update(msg)
 		return h, cmd
+	}
+}
+
+// launchBeadsViewer opens bv (beads viewer) in a tmux horizontal split
+func (h *Home) launchBeadsViewer(inst *session.Instance) tea.Cmd {
+	return func() tea.Msg {
+		cmd := exec.Command("tmux", "split-window", "-h", "-c", inst.ProjectPath, "bv")
+		_ = cmd.Run() // Fire and forget - user sees result directly in tmux
+		return nil
 	}
 }
 
