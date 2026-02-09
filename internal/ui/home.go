@@ -8487,10 +8487,10 @@ func (h *Home) handleBeadsPanelKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
-// launchBeadsViewer opens bv (beads viewer) in a tmux horizontal split
+// launchBeadsViewer opens bv (beads viewer) in a new tmux window (full screen)
 func (h *Home) launchBeadsViewer(inst *session.Instance) tea.Cmd {
 	return func() tea.Msg {
-		cmd := exec.Command("tmux", "split-window", "-h", "-c", inst.ProjectPath, "bv")
+		cmd := exec.Command("tmux", "new-window", "-c", inst.ProjectPath, "bv")
 		_ = cmd.Run() // Fire and forget - user sees result directly in tmux
 		return nil
 	}
