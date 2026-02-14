@@ -24,6 +24,7 @@ func TestForkFlow_Integration(t *testing.T) {
 	parentID := "abc-123-def"
 	parent.ClaudeSessionID = parentID
 	parent.ClaudeDetectedAt = time.Now()
+	createTestSessionFile(t, "/tmp", parentID)
 	t.Logf("Parent session ID (simulated detection): %s", parentID)
 
 	// Verify CanFork is true

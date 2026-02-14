@@ -5174,6 +5174,18 @@ func (i *Instance) Restart() error {
 		i.ensureClaudeSessionIDFromDiskForRestart()
 	}
 
+	// Validate Claude session ID before restart - if corrupted (no conversation data),
+	// clear it so we start fresh instead of using --session-id with a bad ID.
+	// This prevents "session id already exists" errors from repeated restarts.
+	if IsClaudeCompatible(i.Tool) && i.ClaudeSessionID != "" {
+		if !sessionHasConversationData(i, i.ClaudeSessionID) {
+			sessionLog.Debug("restart_clearing_corrupted_session_id",
+				slog.String("rejected_id", i.ClaudeSessionID))
+			i.ClaudeSessionID = ""
+			i.ClaudeDetectedAt = time.Time{}
+		}
+	}
+
 	// If Claude session with known ID AND tmux session exists, use respawn-pane.
 	if IsClaudeCompatible(i.Tool) && i.ClaudeSessionID != "" && i.tmuxSession != nil && i.tmuxSession.Exists() {
 		resumeCmd, containerName, err := i.prepareCommand(i.buildClaudeResumeCommand())
@@ -5865,6 +5877,12 @@ func (i *Instance) buildClaudeForkCommandForTarget(target *Instance, opts *Claud
 
 	if !i.CanFork() {
 		return "", fmt.Errorf("cannot fork: no active Claude session")
+	}
+
+	// Validate that the session we're about to fork has actual conversation data.
+	// This prevents "No conversation found" errors from corrupted session IDs.
+	if !sessionHasConversationData(i.ClaudeSessionID, i.ProjectPath) {
+		return "", fmt.Errorf("cannot fork: session %s has no conversation data (may be corrupted)", i.ClaudeSessionID)
 	}
 
 	workDir := target.ProjectPath
