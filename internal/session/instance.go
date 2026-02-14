@@ -2830,6 +2830,17 @@ func (i *Instance) ForkWithOptions(newTitle, newGroupPath string, opts *ClaudeOp
 		opts = NewClaudeOptions(userConfig)
 	}
 
+	// When forking into a worktree, Claude CLI scopes session lookup by CWD.
+	// The parent session's .jsonl lives under the original project path, but the
+	// fork command runs from the worktree path. Symlink the parent session file
+	// into the worktree's Claude project directory so --resume can find it.
+	if workDir != i.ProjectPath {
+		if err := symlinkSessionForWorktree(i.ClaudeSessionID, i.ProjectPath, workDir); err != nil {
+			sessionLog.Warn("worktree_session_symlink_failed", slog.String("error", err.Error()))
+			// Non-fatal: fork may still work if Claude finds it via cross-project search
+		}
+	}
+
 	// Build extra flags from options (for fork, we use ToArgsForFork which excludes session mode)
 	extraFlags := i.buildClaudeExtraFlags(opts)
 
@@ -3234,6 +3245,80 @@ func (i *Instance) regenerateMCPConfig() error {
 // - File has any "sessionId" field (user interacted with session)
 // - Error reading file (safe fallback - don't risk losing sessions)
 //
+// symlinkSessionForWorktree creates a symlink of the parent session's .jsonl file
+// in the worktree's Claude project directory. This allows `claude --resume <id>`
+// to find the parent session when running from the worktree path, since Claude CLI
+// scopes session lookup by the current working directory.
+func symlinkSessionForWorktree(sessionID, originalPath, worktreePath string) error {
+	if sessionID == "" || originalPath == "" || worktreePath == "" {
+		return fmt.Errorf("missing required parameters")
+	}
+
+	configDir := GetClaudeConfigDir()
+	if configDir == "" {
+		configDir = filepath.Join(os.Getenv("HOME"), ".claude")
+	}
+
+	// Resolve symlinks in both paths (macOS: /tmp -> /private/tmp)
+	resolvedOriginal := originalPath
+	if resolved, err := filepath.EvalSymlinks(originalPath); err == nil {
+		resolvedOriginal = resolved
+	}
+	resolvedWorktree := worktreePath
+	if resolved, err := filepath.EvalSymlinks(worktreePath); err == nil {
+		resolvedWorktree = resolved
+	}
+
+	encodedOriginal := ConvertToClaudeDirName(resolvedOriginal)
+	if encodedOriginal == "" {
+		encodedOriginal = "-"
+	}
+	encodedWorktree := ConvertToClaudeDirName(resolvedWorktree)
+	if encodedWorktree == "" {
+		encodedWorktree = "-"
+	}
+
+	// Same encoded path means Claude will find it — no symlink needed
+	if encodedOriginal == encodedWorktree {
+		return nil
+	}
+
+	sourceFile := filepath.Join(configDir, "projects", encodedOriginal, sessionID+".jsonl")
+
+	// Verify source exists
+	if _, err := os.Stat(sourceFile); os.IsNotExist(err) {
+		// Try cross-project search as fallback
+		if fallback := findSessionFileInAllProjects(sessionID); fallback != "" {
+			sourceFile = fallback
+		} else {
+			return fmt.Errorf("parent session file not found: %s", sourceFile)
+		}
+	}
+
+	targetDir := filepath.Join(configDir, "projects", encodedWorktree)
+	targetFile := filepath.Join(targetDir, sessionID+".jsonl")
+
+	// Already exists (previous fork attempt, etc.)
+	if _, err := os.Stat(targetFile); err == nil {
+		return nil
+	}
+
+	// Create target directory
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory %s: %w", targetDir, err)
+	}
+
+	// Create symlink
+	if err := os.Symlink(sourceFile, targetFile); err != nil {
+		return fmt.Errorf("failed to symlink %s -> %s: %w", targetFile, sourceFile, err)
+	}
+
+	sessionLog.Debug("worktree_session_symlinked",
+		slog.String("source", sourceFile),
+		slog.String("target", targetFile))
+	return nil
+}
+
 // Returns false if:
 // - File doesn't exist (nothing to resume, use --session-id)
 // - File exists but has zero "sessionId" occurrences (never interacted)
