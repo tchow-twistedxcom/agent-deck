@@ -3,6 +3,7 @@ package session
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -17,6 +18,28 @@ func skipIfNoTmuxServer(t *testing.T) {
 	// Check if tmux server is running by trying to list sessions
 	if err := exec.Command("tmux", "list-sessions").Run(); err != nil {
 		t.Skip("tmux server not running")
+	}
+}
+
+// createTestSessionFile creates a .jsonl file with conversation data for testing.
+// Uses the current CLAUDE_CONFIG_DIR (or HOME-based default) to determine where to write.
+func createTestSessionFile(t *testing.T, projectPath, sessionID string) {
+	t.Helper()
+	configDir := GetClaudeConfigDir()
+	if configDir == "" {
+		configDir = filepath.Join(os.Getenv("HOME"), ".claude")
+	}
+	encodedPath := ConvertToClaudeDirName(projectPath)
+	if encodedPath == "" {
+		encodedPath = "-"
+	}
+	projectDir := filepath.Join(configDir, "projects", encodedPath)
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte(`{"sessionId":"` + sessionID + `","type":"human"}`)
+	if err := os.WriteFile(filepath.Join(projectDir, sessionID+".jsonl"), data, 0644); err != nil {
+		t.Fatal(err)
 	}
 }
 

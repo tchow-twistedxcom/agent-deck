@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -338,8 +339,13 @@ func findActiveSessionIDExcluding(configDir, projectPath string, excludeIDs map[
 	// UUID pattern for session files
 	uuidPattern := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$`)
 
-	var mostRecent string
-	var mostRecentTime time.Time
+	// Collect candidates sorted by modification time (most recent first)
+	type candidate struct {
+		sessionID string
+		filePath  string
+		modTime   time.Time
+	}
+	var candidates []candidate
 
 	for _, file := range files {
 		base := filepath.Base(file)
@@ -366,19 +372,46 @@ func findActiveSessionIDExcluding(configDir, projectPath string, excludeIDs map[
 			continue
 		}
 
-		// Find the most recently modified file
-		if info.ModTime().After(mostRecentTime) {
-			mostRecentTime = info.ModTime()
-			mostRecent = sessionID
+		// Only consider files modified within last 5 minutes (actively used)
+		if time.Since(info.ModTime()) < 5*time.Minute {
+			candidates = append(candidates, candidate{sessionID: sessionID, filePath: file, modTime: info.ModTime()})
 		}
 	}
 
-	// Only return if modified within last 5 minutes (actively used)
-	if mostRecent != "" && time.Since(mostRecentTime) < 5*time.Minute {
-		return mostRecent
+	// Sort by modification time descending (most recent first)
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].modTime.After(candidates[j].modTime)
+	})
+
+	// Return the most recent candidate that has actual conversation data
+	for _, c := range candidates {
+		if fileHasConversationData(c.filePath) {
+			return c.sessionID
+		}
 	}
 
 	return ""
+}
+
+// fileHasConversationData checks if a .jsonl file contains actual conversation data
+// (has "sessionId" field entries, not just file-history-snapshot records).
+func fileHasConversationData(filePath string) bool {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	for scanner.Scan() {
+		if strings.Contains(scanner.Text(), `"sessionId"`) {
+			return true
+		}
+	}
+	return false
 }
 
 // getProjectSettingsPath returns the path to .claude/settings.local.json for a project

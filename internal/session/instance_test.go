@@ -119,6 +119,7 @@ func TestInstance_Fork(t *testing.T) {
 	// With session ID, Fork returns uuidgen + --session-id command
 	inst.ClaudeSessionID = "abc-123"
 	inst.ClaudeDetectedAt = time.Now()
+	createTestSessionFile(t, "/tmp/test", "abc-123")
 	cmd, err := inst.Fork("forked-test", "")
 	if err != nil {
 		t.Errorf("Fork() failed: %v", err)
@@ -173,6 +174,7 @@ func TestInstance_Fork_ExplicitConfig(t *testing.T) {
 	inst := NewInstance("test", "/tmp/test")
 	inst.ClaudeSessionID = "abc-123"
 	inst.ClaudeDetectedAt = time.Now()
+	createTestSessionFile(t, "/tmp/test", "abc-123")
 
 	cmd, err := inst.Fork("forked-test", "")
 	if err != nil {
@@ -213,6 +215,7 @@ func TestInstance_CreateForkedInstance(t *testing.T) {
 	// With session ID, creates new instance with fork command
 	inst.ClaudeSessionID = "abc-123"
 	inst.ClaudeDetectedAt = time.Now()
+	createTestSessionFile(t, "/tmp/test", "abc-123")
 	forked, cmd, err := inst.CreateForkedInstance("forked", "")
 	if err != nil {
 		t.Errorf("CreateForkedInstance() failed: %v", err)
@@ -272,6 +275,7 @@ func TestInstance_CreateForkedInstance_ExplicitConfig(t *testing.T) {
 	inst := NewInstance("original", "/tmp/test")
 	inst.ClaudeSessionID = "abc-123"
 	inst.ClaudeDetectedAt = time.Now()
+	createTestSessionFile(t, "/tmp/test", "abc-123")
 
 	_, cmd, err := inst.CreateForkedInstance("forked", "")
 	if err != nil {
@@ -495,6 +499,7 @@ func TestCreateForkedInstance_SessionIDPattern(t *testing.T) {
 	inst := NewInstance("original", "/tmp/test")
 	inst.ClaudeSessionID = "parent-abc-123"
 	inst.ClaudeDetectedAt = time.Now()
+	createTestSessionFile(t, "/tmp/test", "parent-abc-123")
 
 	forked, cmd, err := inst.CreateForkedInstance("forked", "")
 	if err != nil {
@@ -681,8 +686,9 @@ func TestSyncClaudeSessionFromDisk_PicksUpNewerSession(t *testing.T) {
 	oldSessionID := "11111111-1111-1111-1111-111111111111"
 	newSessionID := "22222222-2222-2222-2222-222222222222"
 
+	conversationData := []byte(`{"sessionId":"test","type":"human"}`)
 	oldPath := filepath.Join(projectDir, oldSessionID+".jsonl")
-	if err := os.WriteFile(oldPath, []byte("{}"), 0644); err != nil {
+	if err := os.WriteFile(oldPath, conversationData, 0644); err != nil {
 		t.Fatal(err)
 	}
 	pastTime := time.Now().Add(-30 * time.Second)
@@ -690,7 +696,7 @@ func TestSyncClaudeSessionFromDisk_PicksUpNewerSession(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := os.WriteFile(filepath.Join(projectDir, newSessionID+".jsonl"), []byte("{}"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(projectDir, newSessionID+".jsonl"), conversationData, 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -730,7 +736,8 @@ func TestSyncClaudeSessionFromDisk_NoChangeWhenCurrent(t *testing.T) {
 	}
 
 	currentID := "33333333-3333-3333-3333-333333333333"
-	if err := os.WriteFile(filepath.Join(projectDir, currentID+".jsonl"), []byte("{}"), 0644); err != nil {
+	conversationData := []byte(`{"sessionId":"test","type":"human"}`)
+	if err := os.WriteFile(filepath.Join(projectDir, currentID+".jsonl"), conversationData, 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -773,8 +780,9 @@ func TestSyncClaudeSessionFromDisk_IgnoresAgentFiles(t *testing.T) {
 	realSession := "abcd1234-abcd-abcd-abcd-abcdabcdabcd"
 	agentSession := "agent-eeee5555-eeee-eeee-eeee-eeeeeeeeeeee"
 
+	conversationData := []byte(`{"sessionId":"test","type":"human"}`)
 	realPath := filepath.Join(projectDir, realSession+".jsonl")
-	if err := os.WriteFile(realPath, []byte("{}"), 0644); err != nil {
+	if err := os.WriteFile(realPath, conversationData, 0644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chtimes(realPath, time.Now().Add(-10*time.Second), time.Now().Add(-10*time.Second)); err != nil {
@@ -782,7 +790,7 @@ func TestSyncClaudeSessionFromDisk_IgnoresAgentFiles(t *testing.T) {
 	}
 
 	agentPath := filepath.Join(projectDir, agentSession+".jsonl")
-	if err := os.WriteFile(agentPath, []byte("{}"), 0644); err != nil {
+	if err := os.WriteFile(agentPath, conversationData, 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -804,6 +812,185 @@ func TestSyncClaudeSessionFromDisk_SkipsNonClaude(t *testing.T) {
 	inst.syncClaudeSessionFromDisk()
 	if inst.ClaudeSessionID != "should-not-change" {
 		t.Error("syncClaudeSessionFromDisk should be a no-op for non-claude tools")
+	}
+}
+
+// TestUpdateClaudeSession_RejectsCorruptedTmuxEnv verifies that when the tmux
+// environment has a session ID whose .jsonl file has no conversation data,
+// UpdateClaudeSession rejects it and self-heals the tmux env.
+func TestUpdateClaudeSession_RejectsCorruptedTmuxEnv(t *testing.T) {
+	skipIfNoTmuxServer(t)
+
+	// Set up temp Claude config dir with session files
+	configDir := t.TempDir()
+	origConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	os.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	defer func() {
+		if origConfigDir != "" {
+			os.Setenv("CLAUDE_CONFIG_DIR", origConfigDir)
+		} else {
+			os.Unsetenv("CLAUDE_CONFIG_DIR")
+		}
+	}()
+
+	projectPath := "/tmp"
+	projectDirName := ConvertToClaudeDirName(projectPath)
+	projectDir := filepath.Join(configDir, "projects", projectDirName)
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	goodID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	badID := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+	// Good session has conversation data
+	if err := os.WriteFile(filepath.Join(projectDir, goodID+".jsonl"),
+		[]byte(`{"sessionId":"test","type":"human"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Bad session has only file-history-snapshot (no "sessionId" entries)
+	if err := os.WriteFile(filepath.Join(projectDir, badID+".jsonl"),
+		[]byte(`{"type":"file-history-snapshot","snapshot":{}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create instance with the good session ID
+	inst := NewInstanceWithTool("corrupt-tmux-test", projectPath, "claude")
+	inst.ClaudeSessionID = goodID
+	if err := inst.Start(); err != nil {
+		t.Fatalf("Failed to start instance: %v", err)
+	}
+	defer func() { _ = inst.Kill() }()
+
+	// Set the CORRUPTED session ID in tmux env
+	tmuxSess := inst.GetTmuxSession()
+	if err := tmuxSess.SetEnvironment("CLAUDE_SESSION_ID", badID); err != nil {
+		t.Fatalf("Failed to set environment: %v", err)
+	}
+
+	// Call UpdateClaudeSession
+	inst.UpdateClaudeSession(nil)
+
+	// Should have REJECTED the corrupted ID and kept the good one
+	if inst.ClaudeSessionID != goodID {
+		t.Errorf("ClaudeSessionID = %q, want %q (corrupted ID should be rejected)", inst.ClaudeSessionID, goodID)
+	}
+
+	// Self-healing: tmux env should now have the good ID
+	if envID, err := tmuxSess.GetEnvironment("CLAUDE_SESSION_ID"); err == nil {
+		if envID != goodID {
+			t.Errorf("tmux CLAUDE_SESSION_ID = %q, want %q (should be self-healed)", envID, goodID)
+		}
+	}
+}
+
+// TestUpdateClaudeSession_AcceptsValidNewID verifies that when the tmux
+// environment has a session ID with valid conversation data, it is accepted.
+func TestUpdateClaudeSession_AcceptsValidNewID(t *testing.T) {
+	skipIfNoTmuxServer(t)
+
+	configDir := t.TempDir()
+	origConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	os.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	defer func() {
+		if origConfigDir != "" {
+			os.Setenv("CLAUDE_CONFIG_DIR", origConfigDir)
+		} else {
+			os.Unsetenv("CLAUDE_CONFIG_DIR")
+		}
+	}()
+
+	projectPath := "/tmp"
+	projectDirName := ConvertToClaudeDirName(projectPath)
+	projectDir := filepath.Join(configDir, "projects", projectDirName)
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	oldID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	newID := "cccccccc-cccc-cccc-cccc-cccccccccccc"
+
+	// Both sessions have conversation data
+	conversationData := []byte(`{"sessionId":"test","type":"human"}`)
+	if err := os.WriteFile(filepath.Join(projectDir, oldID+".jsonl"), conversationData, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, newID+".jsonl"), conversationData, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	inst := NewInstanceWithTool("valid-new-id-test", projectPath, "claude")
+	inst.ClaudeSessionID = oldID
+	if err := inst.Start(); err != nil {
+		t.Fatalf("Failed to start instance: %v", err)
+	}
+	defer func() { _ = inst.Kill() }()
+
+	// Set valid new session ID in tmux env
+	tmuxSess := inst.GetTmuxSession()
+	if err := tmuxSess.SetEnvironment("CLAUDE_SESSION_ID", newID); err != nil {
+		t.Fatalf("Failed to set environment: %v", err)
+	}
+
+	inst.UpdateClaudeSession(nil)
+
+	// Should accept the new valid ID
+	if inst.ClaudeSessionID != newID {
+		t.Errorf("ClaudeSessionID = %q, want %q (valid new ID should be accepted)", inst.ClaudeSessionID, newID)
+	}
+}
+
+// TestSyncClaudeSessionFromDisk_RejectsNoConversationData verifies the
+// defense-in-depth check in syncClaudeSessionFromDisk.
+func TestSyncClaudeSessionFromDisk_RejectsNoConversationData(t *testing.T) {
+	configDir := t.TempDir()
+	origConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	os.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	defer func() {
+		if origConfigDir != "" {
+			os.Setenv("CLAUDE_CONFIG_DIR", origConfigDir)
+		} else {
+			os.Unsetenv("CLAUDE_CONFIG_DIR")
+		}
+	}()
+
+	projectPath := "/Users/test/defense-depth"
+	projectDirName := ConvertToClaudeDirName(projectPath)
+	projectDir := filepath.Join(configDir, "projects", projectDirName)
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	goodID := "11111111-1111-1111-1111-111111111111"
+	emptyID := "22222222-2222-2222-2222-222222222222"
+
+	// Good session: older but has conversation data
+	goodPath := filepath.Join(projectDir, goodID+".jsonl")
+	if err := os.WriteFile(goodPath, []byte(`{"sessionId":"test","type":"human"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	pastTime := time.Now().Add(-30 * time.Second)
+	if err := os.Chtimes(goodPath, pastTime, pastTime); err != nil {
+		t.Fatal(err)
+	}
+
+	// Empty session: newer but no conversation data
+	// Note: findActiveSessionIDExcluding should already filter this out,
+	// but this tests the defense-in-depth in syncClaudeSessionFromDisk
+	emptyPath := filepath.Join(projectDir, emptyID+".jsonl")
+	if err := os.WriteFile(emptyPath, []byte(`{"type":"file-history-snapshot"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	inst := NewInstanceWithTool("defense-depth-test", projectPath, "claude")
+	inst.ClaudeSessionID = goodID
+	inst.ClaudeDetectedAt = time.Now().Add(-1 * time.Minute)
+
+	inst.syncClaudeSessionFromDisk()
+
+	// Should NOT have changed to emptyID (filtered by both findActiveSessionIDExcluding and defense-in-depth)
+	if inst.ClaudeSessionID != goodID {
+		t.Errorf("ClaudeSessionID = %q, want %q (empty session should be rejected)", inst.ClaudeSessionID, goodID)
 	}
 }
 
@@ -1464,6 +1651,7 @@ func TestInstance_Fork_PathWithSpaces(t *testing.T) {
 		ClaudeSessionID:  "session-abc-123",
 		ClaudeDetectedAt: time.Now(),
 	}
+	createTestSessionFile(t, "/tmp/Test Path With Spaces", "session-abc-123")
 
 	cmd, err := inst.Fork("forked-session", "")
 	if err != nil {
@@ -1576,6 +1764,7 @@ func TestInstance_Fork_RespectsDangerousMode(t *testing.T) {
 		ClaudeSessionID:  "session-xyz-789",
 		ClaudeDetectedAt: time.Now(),
 	}
+	createTestSessionFile(t, "/tmp/test", "session-xyz-789")
 
 	// Test with dangerous_mode = false
 	t.Run("dangerous_mode=false", func(t *testing.T) {

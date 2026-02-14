@@ -441,10 +441,21 @@ func TestFindActiveSessionIDExcluding(t *testing.T) {
 
 	sessionA := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 	sessionB := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
-	if err := os.WriteFile(filepath.Join(projectDir, sessionA+".jsonl"), []byte("{}"), 0644); err != nil {
+	conversationData := []byte(`{"sessionId":"test","type":"human"}`)
+	pathA := filepath.Join(projectDir, sessionA+".jsonl")
+	pathB := filepath.Join(projectDir, sessionB+".jsonl")
+	if err := os.WriteFile(pathA, conversationData, 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(projectDir, sessionB+".jsonl"), []byte("{}"), 0644); err != nil {
+	if err := os.WriteFile(pathB, conversationData, 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Ensure A is older than B with explicit timestamps
+	now := time.Now()
+	if err := os.Chtimes(pathA, now.Add(-2*time.Second), now.Add(-2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(pathB, now, now); err != nil {
 		t.Fatal(err)
 	}
 
@@ -487,6 +498,30 @@ func TestFindActiveSessionIDExcluding(t *testing.T) {
 		got := findActiveSessionIDExcluding(configDir, "/no/such/project", nil)
 		if got != "" {
 			t.Errorf("got %q, want empty for nonexistent project", got)
+		}
+	})
+
+	t.Run("skips files without conversation data", func(t *testing.T) {
+		// Create an empty session (no "sessionId" entries, like file-history-snapshot only)
+		emptySession := "cccccccc-cccc-cccc-cccc-cccccccccccc"
+		emptyData := []byte(`{"type":"file-history-snapshot","snapshot":{}}`)
+		emptyPath := filepath.Join(projectDir, emptySession+".jsonl")
+		if err := os.WriteFile(emptyPath, emptyData, 0644); err != nil {
+			t.Fatal(err)
+		}
+		// Make it the newest file
+		futureTime := time.Now().Add(1 * time.Second)
+		if err := os.Chtimes(emptyPath, futureTime, futureTime); err != nil {
+			t.Fatal(err)
+		}
+
+		// Should skip the empty session and return sessionB (has conversation data)
+		got := findActiveSessionIDExcluding(configDir, projectPath, nil)
+		if got == emptySession {
+			t.Errorf("got %q (empty session), should have been skipped", got)
+		}
+		if got != sessionB {
+			t.Errorf("got %q, want %q (most recent with conversation data)", got, sessionB)
 		}
 	})
 }
