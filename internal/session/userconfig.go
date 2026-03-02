@@ -829,6 +829,10 @@ type MCPDef struct {
 	// Example: { Authorization = "Bearer token123" }
 	Headers map[string]string `toml:"headers"`
 
+	// OAuth configures OAuth authentication for HTTP/SSE MCPs (e.g., Slack)
+	// Claude Code handles the OAuth flow; agent-deck passes through the config
+	OAuth *OAuthConfig `toml:"oauth"`
+
 	// Server defines how to auto-start an HTTP MCP server process
 	// When set, agent-deck will start the server before connecting via HTTP
 	// This is optional - you can also connect to externally managed servers
@@ -1871,7 +1875,11 @@ auto_cleanup = true
 # HTTP/SSE MCPs (remote servers):
 #   url         - The endpoint URL (http:// or https://)
 #   transport   - "http" or "sse" (defaults to "http" if url is set)
+#   headers     - HTTP headers (optional, e.g., for Bearer tokens)
 #   description - Help text shown in the MCP Manager (optional)
+#   [mcps.NAME.oauth] - OAuth config (optional):
+#     client_id     - OAuth client ID
+#     callback_port - Local port for OAuth callback
 
 # ---------- STDIO Examples ----------
 
@@ -1920,6 +1928,15 @@ auto_cleanup = true
 # url = "https://api.example.com/mcp/sse"
 # transport = "sse"
 # description = "Remote SSE-based MCP"
+
+# Example: OAuth-authenticated MCP (e.g., Slack)
+# [mcps.slack]
+# url = "https://mcp.slack.com/mcp"
+# transport = "http"
+# description = "Slack workspace messaging"
+# [mcps.slack.oauth]
+# client_id = "your-client-id"
+# callback_port = 3118
 
 # ---------- HTTP MCP with Auto-Start Server ----------
 # For MCPs that need a local server process (e.g., piekstra/slack-mcp-server),

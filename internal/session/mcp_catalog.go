@@ -24,6 +24,13 @@ type MCPServerConfig struct {
 	Env     map[string]string `json:"env,omitempty"`
 	URL     string            `json:"url,omitempty"`     // For HTTP transport
 	Headers map[string]string `json:"headers,omitempty"` // For HTTP transport (e.g., Authorization)
+	OAuth   *OAuthConfig      `json:"oauth,omitempty"`   // For OAuth-authenticated MCPs (e.g., Slack)
+}
+
+// OAuthConfig represents OAuth configuration for an MCP server
+type OAuthConfig struct {
+	ClientID     string `json:"clientId" toml:"client_id"`
+	CallbackPort int    `json:"callbackPort,omitempty" toml:"callback_port"`
 }
 
 // getExternalSocketPath returns the socket path if an external pool socket exists and is alive
@@ -178,6 +185,7 @@ func WriteMCPJsonFromConfig(projectPath string, enabledNames []string) error {
 					Type:    transport,
 					URL:     def.URL,
 					Headers: def.Headers,
+					OAuth:   def.OAuth,
 				}
 				mcpCatLog.Info("transport_http", slog.String("mcp", name), slog.String("scope", "local"), slog.String("transport", transport), slog.String("url", def.URL))
 				continue
@@ -290,6 +298,7 @@ func WriteGlobalMCP(enabledNames []string) error {
 					Type:    transport,
 					URL:     def.URL,
 					Headers: def.Headers,
+					OAuth:   def.OAuth,
 				}
 				mcpCatLog.Info("transport_http", slog.String("mcp", name), slog.String("scope", "global"), slog.String("transport", transport), slog.String("url", def.URL))
 				continue
@@ -514,6 +523,7 @@ func WriteUserMCP(enabledNames []string) error {
 					Type:    transport,
 					URL:     def.URL,
 					Headers: def.Headers,
+					OAuth:   def.OAuth,
 				}
 				mcpCatLog.Info("transport_http", slog.String("mcp", name), slog.String("scope", "user"), slog.String("transport", transport), slog.String("url", def.URL))
 				continue
