@@ -1,0 +1,187 @@
+name: Upstream Sync
+
+on:
+  schedule:
+    # Check daily at 9am UTC
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync-main:
+    runs-on: ubuntu-latest
+    outputs:
+      synced: ${{ steps.sync.outputs.synced }}
+      new_version: ${{ steps.sync.outputs.new_version }}
+      old_version: ${{ steps.sync.outputs.old_version }}
+      commits_synced: ${{ steps.sync.outputs.commits_synced }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+          # PAT with 'repo' + 'workflow' scopes required to push workflow file changes
+          token: ${{ secrets.UPSTREAM_SYNC_PAT }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/asheshgoplani/agent-deck.git || true
+          git fetch upstream --tags
+
+      - name: Save fork-only files
+        run: |
+          # Preserve workflow files that only exist in our fork (not upstream).
+          # These would be lost when we reset to upstream/main.
+          mkdir -p /tmp/fork-workflows
+          cp -v .github/workflows/upstream-sync.yml /tmp/fork-workflows/ || true
+          cp -v .github/workflows/ci.yml /tmp/fork-workflows/ || true
+
+      - name: Sync main with upstream
+        id: sync
+        run: |
+          # Get current version before sync
+          OLD_VERSION=$(grep 'const Version' cmd/agent-deck/main.go | sed 's/.*"\(.*\)".*/\1/' || echo "unknown")
+          echo "old_version=$OLD_VERSION" >> $GITHUB_OUTPUT
+
+          # Check if we're behind upstream
+          BEHIND=$(git rev-list --count main..upstream/main)
+
+          if [ "$BEHIND" -eq 0 ]; then
+            echo "✅ main is already up to date with upstream"
+            echo "synced=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "📥 main is $BEHIND commits behind upstream, syncing..."
+
+          # Hard-reset to upstream/main, then re-add fork-only files on top.
+          # This is more reliable than rebase, which can silently drop our
+          # workflow commit when upstream rewrites history or conflicts arise.
+          git reset --hard upstream/main
+
+          # Restore fork-only workflow files
+          mkdir -p .github/workflows
+          cp -v /tmp/fork-workflows/* .github/workflows/
+          git add .github/workflows/upstream-sync.yml .github/workflows/ci.yml
+
+          # Only commit if files differ from upstream (they always should,
+          # since upstream doesn't have these files)
+          if ! git diff --cached --quiet; then
+            git commit -m "ci: re-add fork-only workflow files (upstream-sync, ci)"
+          fi
+
+          # Get new version after sync
+          NEW_VERSION=$(grep 'const Version' cmd/agent-deck/main.go | sed 's/.*"\(.*\)".*/\1/' || echo "unknown")
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "commits_synced=$BEHIND" >> $GITHUB_OUTPUT
+          echo "synced=true" >> $GITHUB_OUTPUT
+
+          # Force push required (safe - this workflow is the only writer to main)
+          git push origin main --force-with-lease
+
+      - name: Summary
+        if: steps.sync.outputs.synced == 'true'
+        run: |
+          echo "## ✅ Main Branch Synced" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| | Version |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Previous | v${{ steps.sync.outputs.old_version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Current | v${{ steps.sync.outputs.new_version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commits synced:** ${{ steps.sync.outputs.commits_synced }}" >> $GITHUB_STEP_SUMMARY
+
+  check-custom-dev:
+    needs: sync-main
+    if: needs.sync-main.outputs.synced == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: custom/dev
+
+      - name: Check if custom/dev needs rebase
+        id: check
+        run: |
+          git fetch origin main
+
+          # Check if custom/dev is behind main
+          BEHIND=$(git rev-list --count custom/dev..origin/main)
+          AHEAD=$(git rev-list --count origin/main..custom/dev)
+
+          echo "custom/dev is $AHEAD commits ahead and $BEHIND commits behind main"
+          echo "behind=$BEHIND" >> $GITHUB_OUTPUT
+          echo "ahead=$AHEAD" >> $GITHUB_OUTPUT
+
+      - name: Create rebase notification issue
+        if: steps.check.outputs.behind != '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `🔄 custom/dev needs rebase (main synced to v${{ needs.sync-main.outputs.new_version }})`;
+            const body = `The \`main\` branch was automatically synced with upstream.
+
+            ## Status
+            | Branch | Status |
+            |--------|--------|
+            | \`main\` | ✅ Synced to v${{ needs.sync-main.outputs.new_version }} |
+            | \`custom/dev\` | ⚠️ ${{ steps.check.outputs.behind }} commits behind main |
+
+            ## Rebase Instructions
+            \`\`\`bash
+            git fetch origin
+            git checkout custom/dev
+            git rebase origin/main
+            # Resolve any conflicts if needed
+            git push origin custom/dev --force-with-lease
+            \`\`\`
+
+            ## What Changed
+            - **Previous version:** v${{ needs.sync-main.outputs.old_version }}
+            - **New version:** v${{ needs.sync-main.outputs.new_version }}
+            - **Commits synced:** ${{ needs.sync-main.outputs.commits_synced }}
+
+            See [upstream releases](https://github.com/asheshgoplani/agent-deck/releases) for changelog.
+            `;
+
+            // Check if issue already exists
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'upstream-sync'
+            });
+
+            const existing = issues.data.find(i => i.title.includes('custom/dev needs rebase'));
+            if (existing) {
+              // Update existing issue
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body: body
+              });
+              console.log(`Updated existing issue #${existing.number}`);
+            } else {
+              // Create new issue
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['upstream-sync']
+              });
+              console.log('Created new rebase notification issue');
+            }
+
+      - name: Summary
+        run: |
+          echo "## 📊 custom/dev Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Ahead of main:** ${{ steps.check.outputs.ahead }} commits (custom changes)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Behind main:** ${{ steps.check.outputs.behind }} commits (needs rebase)" >> $GITHUB_STEP_SUMMARY
