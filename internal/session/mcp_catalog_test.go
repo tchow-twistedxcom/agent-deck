@@ -124,6 +124,44 @@ func TestMCPServerConfigSSE(t *testing.T) {
 	}
 }
 
+func TestMCPServerConfigOAuth(t *testing.T) {
+	// Test that MCPServerConfig marshals OAuth config correctly (e.g., Slack MCP)
+	config := MCPServerConfig{
+		Type: "http",
+		URL:  "https://mcp.slack.com/mcp",
+		OAuth: &OAuthConfig{
+			ClientID:     "1601185624273.8899143856786",
+			CallbackPort: 3118,
+		},
+	}
+
+	data, err := json.Marshal(config)
+	if err != nil {
+		t.Fatalf("Failed to marshal: %v", err)
+	}
+
+	var parsed MCPServerConfig
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("Failed to unmarshal: %v", err)
+	}
+
+	if parsed.OAuth == nil {
+		t.Fatal("OAuth config should not be nil")
+	}
+	if parsed.OAuth.ClientID != config.OAuth.ClientID {
+		t.Errorf("OAuth ClientID mismatch: got %q, want %q", parsed.OAuth.ClientID, config.OAuth.ClientID)
+	}
+	if parsed.OAuth.CallbackPort != config.OAuth.CallbackPort {
+		t.Errorf("OAuth CallbackPort mismatch: got %d, want %d", parsed.OAuth.CallbackPort, config.OAuth.CallbackPort)
+	}
+
+	// Verify JSON output matches expected format
+	expected := `{"type":"http","url":"https://mcp.slack.com/mcp","oauth":{"clientId":"1601185624273.8899143856786","callbackPort":3118}}`
+	if string(data) != expected {
+		t.Errorf("JSON mismatch:\ngot:  %s\nwant: %s", string(data), expected)
+	}
+}
+
 func TestGetGlobalMCPNames(t *testing.T) {
 	// Create temp directory for Claude config
 	tmpDir, err := os.MkdirTemp("", "claude-test-*")
