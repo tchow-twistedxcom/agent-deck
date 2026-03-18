@@ -58,6 +58,7 @@ Claude Code integration settings.
 ```toml
 [claude]
 config_dir = "~/.claude"           # Path to Claude config directory
+use_happy = false                  # Launch Claude via happy
 dangerous_mode = true              # Enable --dangerously-skip-permissions
 auto_mode = false                  # Enable --permission-mode auto (classifier-based)
 allow_dangerous_mode = false       # Enable --allow-dangerously-skip-permissions
@@ -120,11 +121,13 @@ Codex CLI integration settings.
 ```toml
 [codex]
 yolo_mode = true   # Enable --yolo (bypass approvals and sandbox)
+use_happy = false  # Launch Codex via happy codex
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `yolo_mode` | bool | `false` | Maps to `codex --yolo` (`--dangerously-bypass-approvals-and-sandbox`). Can be overridden per-session. |
+| `use_happy` | bool | `false` | Launch built-in Codex sessions via `happy codex`. Can be overridden per-session. |
 
 ## [docker] Section
 
@@ -432,6 +435,7 @@ ignore_missing_env_files = true
 
 [claude]
 config_dir = "~/.claude"
+use_happy = false
 dangerous_mode = true
 env_file = "~/.claude.env"
 
@@ -440,6 +444,7 @@ config_dir = "~/.claude-work"
 
 [codex]
 yolo_mode = false
+use_happy = false
 
 [docker]
 default_enabled = false

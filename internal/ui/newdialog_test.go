@@ -380,6 +380,7 @@ func TestNewDialog_RestoreSnapshot_RestoresToolOptionsAndCommandInput(t *testing
 	originalClaude := &session.ClaudeOptions{
 		SessionMode:          "resume",
 		ResumeSessionID:      "abc123",
+		UseHappy:             true,
 		SkipPermissions:      true,
 		AllowSkipPermissions: false,
 		UseChrome:            true,
@@ -391,7 +392,7 @@ func TestNewDialog_RestoreSnapshot_RestoresToolOptionsAndCommandInput(t *testing
 	d.commandInput.SetValue("echo original")
 	d.claudeOptions.SetFromOptions(originalClaude)
 	d.geminiOptions.SetDefaults(true)
-	d.codexOptions.SetDefaults(true)
+	d.codexOptions.SetDefaults(true, true)
 
 	snapshot := d.saveSnapshot()
 
@@ -402,7 +403,7 @@ func TestNewDialog_RestoreSnapshot_RestoresToolOptionsAndCommandInput(t *testing
 	d.commandInput.SetValue("echo mutated")
 	d.claudeOptions.SetFromOptions(&session.ClaudeOptions{SessionMode: "new"})
 	d.geminiOptions.SetDefaults(false)
-	d.codexOptions.SetDefaults(false)
+	d.codexOptions.SetDefaults(false, false)
 
 	d.restoreSnapshot(snapshot)
 
@@ -427,7 +428,7 @@ func TestNewDialog_RestoreSnapshot_RestoresToolOptionsAndCommandInput(t *testing
 		t.Fatalf("restored Claude session mode/id = %q/%q, want resume/abc123",
 			restoredClaude.SessionMode, restoredClaude.ResumeSessionID)
 	}
-	if !restoredClaude.SkipPermissions || !restoredClaude.UseChrome || !restoredClaude.UseTeammateMode {
+	if !restoredClaude.UseHappy || !restoredClaude.SkipPermissions || !restoredClaude.UseChrome || !restoredClaude.UseTeammateMode {
 		t.Fatalf("restored Claude toggles incorrect: %+v", restoredClaude)
 	}
 	if !d.geminiOptions.GetYoloMode() {
@@ -435,6 +436,27 @@ func TestNewDialog_RestoreSnapshot_RestoresToolOptionsAndCommandInput(t *testing
 	}
 	if !d.codexOptions.GetYoloMode() {
 		t.Fatal("codex yolo mode was not restored")
+	}
+	if !d.codexOptions.GetUseHappy() {
+		t.Fatal("codex happy mode was not restored")
+	}
+}
+
+func TestNewDialog_GetCodexOptions(t *testing.T) {
+	d := NewNewDialog()
+	d.commandCursor = 4 // codex
+	d.updateToolOptions()
+	d.codexOptions.SetDefaults(true, true)
+
+	opts := d.GetCodexOptions()
+	if opts == nil {
+		t.Fatal("GetCodexOptions returned nil")
+	}
+	if opts.YoloMode == nil || !*opts.YoloMode {
+		t.Fatalf("expected YoloMode=true, got %+v", opts)
+	}
+	if opts.UseHappy == nil || !*opts.UseHappy {
+		t.Fatalf("expected UseHappy=true, got %+v", opts)
 	}
 }
 
