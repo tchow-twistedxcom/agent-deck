@@ -246,7 +246,7 @@ func (h *HelpOverlay) View() string {
 				{mcpKey, "MCP Manager (Claude/Gemini)"},
 				{pluginKey, "Plugin Manager (Claude — RFC PLUGIN_ATTACH.md)"},
 				{skillsKey, "Skills Manager"},
-				{"$", "Cost Dashboard"},
+				{"C", "Cost Dashboard"},
 				{previewKey, "Toggle preview mode (output/stats/both)"},
 				{"< / >", "Shrink / grow preview pane by 5% (issue #1092)"},
 				{unreadKey, "Mark unread"},
