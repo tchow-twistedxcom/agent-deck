@@ -606,8 +606,8 @@ func handleSessionFork(profile string, args []string) {
 	groupShort := fs.String("g", "", "Group for forked session (short)")
 	worktreeBranch := fs.String("w", "", "Create fork in git worktree for branch")
 	worktreeBranchLong := fs.String("worktree", "", "Create fork in git worktree for branch")
-	newBranch := fs.Bool("b", false, "Create new branch (use with --worktree)")
-	newBranchLong := fs.Bool("new-branch", false, "Create new branch")
+	newBranch := fs.Bool("b", false, "Create new branch if needed (reuse existing branch when present)")
+	newBranchLong := fs.Bool("new-branch", false, "Create new branch if needed (reuse existing branch when present)")
 	withState := fs.Bool("with-state", false, "Copy parent's staged+unstaged+untracked files into the new worktree (#1029, requires -w)")
 	withStateGitignored := fs.Bool("with-state-and-gitignored", false, "Like --with-state, plus gitignored files (e.g. .env). Implies --with-state. Requires -w.")
 	sandbox := fs.Bool("sandbox", false, "Run forked session in Docker sandbox")
@@ -699,7 +699,7 @@ func handleSessionFork(profile string, args []string) {
 	if *worktreeBranchLong != "" {
 		wtBranch = *worktreeBranchLong
 	}
-	createNewBranch := *newBranch || *newBranchLong
+	_ = *newBranch || *newBranchLong
 
 	// #1029: --with-state-and-gitignored implies --with-state.
 	wantState := *withState || *withStateGitignored
@@ -724,8 +724,8 @@ func handleSessionFork(profile string, args []string) {
 		wtSettings := session.GetWorktreeSettings()
 		wtBranch = wtSettings.ApplyBranchPrefix(wtBranch)
 
-		if !createNewBranch && !backend.BranchExists(wtBranch) {
-			out.Error(fmt.Sprintf("branch '%s' does not exist (use -b to create)", wtBranch), ErrCodeInvalidOperation)
+		if err := git.ValidateBranchName(wtBranch); err != nil {
+			out.Error(fmt.Sprintf("invalid branch name: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
 
