@@ -144,6 +144,7 @@ type settingDisplay struct {
 // NewDialog represents the new session creation dialog.
 type NewDialog struct {
 	nameInput            textinput.Model
+	generatedName        string // auto-generated name shown as placeholder, used when user leaves name empty
 	pathInput            textinput.Model
 	commandInput         textinput.Model
 	claudeOptions        *ClaudeOptionsPanel // Claude-specific options (concrete for value extraction).
@@ -320,6 +321,8 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string, conduc
 	d.focusIndex = 0
 	d.validationErr = ""
 	d.nameInput.SetValue("")
+	d.generatedName = session.GenerateSessionName()
+	d.nameInput.Placeholder = d.generatedName
 	d.nameInput.Focus()
 	d.suggestionNavigated = false // reset on show
 	d.pathSuggestionCursor = 0    // reset cursor too
@@ -382,7 +385,7 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string, conduc
 		d.inheritedSettings = buildInheritedSettings(userConfig.Docker)
 		d.branchPrefix = userConfig.Worktree.Prefix()
 	}
-	d.branchInput.Placeholder = d.branchPrefix + "branch-name"
+	d.branchInput.Placeholder = d.branchPrefix + d.generatedName
 	d.rebuildFocusTargets()
 }
 
@@ -607,6 +610,9 @@ func (d *NewDialog) IsVisible() bool {
 // GetValues returns the current dialog values with expanded paths
 func (d *NewDialog) GetValues() (name, path, command string) {
 	name = strings.TrimSpace(d.nameInput.Value())
+	if name == "" {
+		name = d.generatedName
+	}
 	// Fix: sanitize input to remove surrounding quotes that cause path issues
 	path = strings.Trim(strings.TrimSpace(d.pathInput.Value()), "'\"")
 
@@ -642,9 +648,16 @@ func (d *NewDialog) ToggleWorktree() {
 
 // autoBranchFromName sets the branch input to "<prefix><session-name>" if the
 // name field is non-empty and the branch hasn't been manually edited.
+// When the name is empty but a generated name exists, it updates the placeholder instead.
 func (d *NewDialog) autoBranchFromName() {
 	name := strings.TrimSpace(d.nameInput.Value())
 	if name == "" {
+		// No user-typed name — show generated branch as placeholder only
+		if d.generatedName != "" {
+			d.branchInput.Placeholder = d.branchPrefix + d.generatedName
+		}
+		d.branchInput.SetValue("")
+		d.branchAutoSet = true
 		return
 	}
 	branch := d.branchPrefix + name
@@ -661,6 +674,9 @@ func (d *NewDialog) IsWorktreeEnabled() bool {
 func (d *NewDialog) GetValuesWithWorktree() (name, path, command, branch string, worktreeEnabled bool) {
 	name, path, command = d.GetValues()
 	branch = strings.TrimSpace(d.branchInput.Value())
+	if branch == "" && d.worktreeEnabled && d.generatedName != "" {
+		branch = d.branchPrefix + name
+	}
 	worktreeEnabled = d.worktreeEnabled
 	return
 }
@@ -769,7 +785,10 @@ func (d *NewDialog) Validate() string {
 	// Fix: sanitize input to remove surrounding quotes that cause path issues
 	path := strings.Trim(strings.TrimSpace(d.pathInput.Value()), "'\"")
 
-	// Check for empty name
+	// Fall back to auto-generated name if user left it empty
+	if name == "" {
+		name = d.generatedName
+	}
 	if name == "" {
 		return "Session name cannot be empty"
 	}
@@ -808,6 +827,9 @@ func (d *NewDialog) Validate() string {
 	// Validate worktree branch if enabled
 	if d.worktreeEnabled {
 		branch := strings.TrimSpace(d.branchInput.Value())
+		if branch == "" && name != "" {
+			branch = d.branchPrefix + name
+		}
 		if branch == "" {
 			return "Branch name required for worktree"
 		}
