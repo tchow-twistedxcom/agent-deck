@@ -812,6 +812,11 @@ type ClaudeSettings struct {
 	// This allows using shell aliases that set CLAUDE_CONFIG_DIR automatically
 	Command string `toml:"command"`
 
+	// UseHappy launches Claude via the happy wrapper by default.
+	// Ignored when Command is set to a custom alias or command.
+	// Default: false
+	UseHappy bool `toml:"use_happy"`
+
 	// ConfigDir is the path to Claude's config directory
 	// Default: ~/.claude (or CLAUDE_CONFIG_DIR env var)
 	ConfigDir string `toml:"config_dir"`
@@ -1034,6 +1039,10 @@ type CodexSettings struct {
 	// Sourced AFTER global [shell].env_files
 	// Path can be absolute, ~ for home, $HOME/${VAR} for env vars, or relative to session working directory
 	EnvFile string `toml:"env_file"`
+
+	// UseHappy launches Codex via "happy codex" by default.
+	// Default: false
+	UseHappy bool `toml:"use_happy"`
 }
 
 // GetProfileCodexConfigDir returns the profile-specific Codex config directory, if configured.
@@ -2789,6 +2798,8 @@ func CreateExampleConfig() error {
 # Enable Chrome / teammate mode by default
 # use_chrome = false
 # use_teammate_mode = false
+# Launch Claude via happy by default (default: false)
+# use_happy = true
 
 # Gemini CLI integration
 # [gemini]
@@ -2814,6 +2825,8 @@ func CreateExampleConfig() error {
 # config_dir = "~/.codex-work"
 # Enable --yolo (bypass approvals and sandbox) by default (default: false)
 # yolo_mode = true
+# Launch Codex via happy by default (default: false)
+# use_happy = true
 
 # Log file management
 # Agent-deck logs session output to ~/.agent-deck/logs/ for status detection

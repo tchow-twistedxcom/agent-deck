@@ -724,10 +724,15 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 		baseCommand = "claude"
 	}
 
-	// Get the configured Claude command (e.g., "claude", "cdw", "cdp")
-	// If a custom command is set, we skip CLAUDE_CONFIG_DIR prefix since the alias handles it
-	claudeCmd := GetClaudeCommand()
-	hasCustomCommand := claudeCmd != "claude"
+	// Get options - either from instance or create defaults from config
+	opts := i.GetClaudeOptions()
+	if opts == nil {
+		// Fall back to config defaults
+		userConfig, _ := LoadUserConfig()
+		opts = NewClaudeOptions(userConfig)
+	}
+
+	claudeCmd, hasCustomCommand := resolveClaudeLaunchCommand(opts)
 
 	// Resolve CLAUDE_CONFIG_DIR for this spawn. We inject the prefix only
 	// when the user has an explicit config_dir resolved for this instance
@@ -756,14 +761,6 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 	instanceIDPrefix := fmt.Sprintf("AGENTDECK_INSTANCE_ID=%s ", i.ID)
 	configDirPrefix = instanceIDPrefix + configDirPrefix
 
-	// Get options - either from instance or create defaults from config
-	opts := i.GetClaudeOptions()
-	if opts == nil {
-		// Fall back to config defaults
-		userConfig, _ := LoadUserConfig()
-		opts = NewClaudeOptions(userConfig)
-	}
-
 	// S8 (v1.7.40) defense-in-depth: non-channel-owning claude spawns
 	// wrap the final exec in `env -u TELEGRAM_*` so the child process
 	// is guaranteed to start without telegram env even if the shell
@@ -776,6 +773,7 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 	if flags := telegramExecEnvStripFlags(i); flags != "" {
 		execEnvPrefix = "env " + flags + " "
 	}
+
 
 	// If baseCommand is just "claude", build the appropriate command
 	if baseCommand == "claude" {
@@ -867,6 +865,32 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 	// group env_file exports AND CLAUDE_CONFIG_DIR both land in the spawn env
 	// before exec'ing the wrapper.
 	return i.buildEnvSourceCommand() + i.buildBashExportPrefix() + baseCommand
+}
+
+func resolveClaudeLaunchCommand(opts *ClaudeOptions) (cmd string, hasCustomCommand bool) {
+	if opts == nil {
+		userConfig, _ := LoadUserConfig()
+		opts = NewClaudeOptions(userConfig)
+	}
+
+	configuredCmd := GetClaudeCommand()
+	if configuredCmd == "" {
+		configuredCmd = "claude"
+	}
+
+	hasCustomCommand = configuredCmd != "claude"
+	if hasCustomCommand {
+		return configuredCmd, true
+	}
+
+	if opts != nil {
+		if opts.UseHappy {
+			return "happy", false
+		}
+		return configuredCmd, false
+	}
+
+	return configuredCmd, false
 }
 
 // buildBashExportPrefix builds the export prefix used in bash -c commands.
@@ -1142,8 +1166,8 @@ func (i *Instance) DetectOpenCodeSession() {
 	i.detectOpenCodeSessionAsync()
 }
 
-// buildCodexCommand builds the command for OpenAI Codex CLI
-// resolveCodexYoloFlag returns " --yolo" if yolo mode is enabled (per-session override > global config), or "".
+// resolveCodexYoloFlag returns " --yolo" if yolo mode is enabled
+// (per-session override > global config), or "".
 func (i *Instance) resolveCodexYoloFlag() string {
 	opts := i.GetCodexOptions()
 	if opts != nil && opts.YoloMode != nil {
@@ -1263,6 +1287,17 @@ func (i *Instance) getCodexHomeDir() string {
 	return getCodexHomeDirForCommand(i.resolveCodexCommand(i.Command))
 }
 
+func (i *Instance) resolveCodexUseHappy() bool {
+	opts := i.GetCodexOptions()
+	if opts != nil && opts.UseHappy != nil {
+		return *opts.UseHappy
+	}
+	if config, err := LoadUserConfig(); err == nil && config != nil {
+		return config.Codex.UseHappy
+	}
+	return false
+}
+
 // Codex stores sessions in ~/.codex/sessions/YYYY/MM/DD/*.jsonl
 // Resume: codex resume <session-id> or codex resume --last
 // Also sources .env files from [shell].env_files
@@ -1302,6 +1337,11 @@ func (i *Instance) buildCodexCommand(baseCommand string) string {
 		envPrefix += "CODEX_HOME=" + codexHome + " "
 	}
 
+	codexCmd := "codex"
+	if i.resolveCodexUseHappy() {
+		codexCmd = "happy codex"
+	}
+
 	yoloFlag := i.resolveCodexYoloFlag()
 	modelFlag := i.resolveCodexModelFlag()
 	command := i.resolveCodexCommand(baseCommand)
@@ -1324,6 +1364,10 @@ func (i *Instance) buildCodexCommand(baseCommand string) string {
 		i.CodexSessionID = ""
 		i.CodexDetectedAt = time.Time{}
 		ClearHookSessionAnchor(i.ID)
+	}
+	// Use happy-wrapped command when base is plain "codex"
+	if command == "codex" {
+		command = codexCmd
 	}
 
 	if i.CodexSessionID != "" {
@@ -5826,7 +5870,8 @@ func (i *Instance) buildClaudeForkCommandForTarget(target *Instance, opts *Claud
 	workDir := target.ProjectPath
 
 	// IMPORTANT: For capture-resume commands (which contain $(...) syntax), we MUST use
-	// "claude" binary + explicit env exports, NOT a custom command alias like "cdw".
+	// the default launch binary ("claude" or "happy") + explicit env exports, NOT a
+	// custom command alias like "cdw".
 	// Reason: Commands with $(...) get wrapped in `bash -c` for fish compatibility (#47),
 	// and shell aliases are not available in non-interactive bash shells.
 	bashExportPrefix := target.buildBashExportPrefix()
@@ -5835,6 +5880,11 @@ func (i *Instance) buildClaudeForkCommandForTarget(target *Instance, opts *Claud
 	if opts == nil {
 		userConfig, _ := LoadUserConfig()
 		opts = NewClaudeOptions(userConfig)
+	}
+
+	claudeCmd, hasCustomCommand := resolveClaudeLaunchCommand(opts)
+	if hasCustomCommand {
+		claudeCmd = "claude"
 	}
 
 	// Build extra flags from options (for fork, we use ToArgsForFork which excludes session mode)
@@ -5849,9 +5899,9 @@ func (i *Instance) buildClaudeForkCommandForTarget(target *Instance, opts *Claud
 	target.ClaudeSessionID = forkUUID
 	cmd := fmt.Sprintf(
 		`cd '%s' && `+
-			`%sexec claude --session-id "%s" --resume %s --fork-session%s`,
+			`%sexec %s --session-id "%s" --resume %s --fork-session%s`,
 		workDir,
-		bashExportPrefix, forkUUID, i.ClaudeSessionID, extraFlags)
+		bashExportPrefix, claudeCmd, forkUUID, i.ClaudeSessionID, extraFlags)
 	cmd, err := i.applyWrapper(cmd)
 	if err != nil {
 		return "", err

@@ -65,6 +65,7 @@ Claude Code integration settings.
 ```toml
 [claude]
 config_dir = "~/.claude"           # Path to Claude config directory
+use_happy = false                  # Launch Claude via happy
 dangerous_mode = true              # Enable --dangerously-skip-permissions
 auto_mode = false                  # Enable --permission-mode auto (classifier-based)
 allow_dangerous_mode = false       # Enable --allow-dangerously-skip-permissions
@@ -175,6 +176,7 @@ command = "codex"  # Codex CLI command or alias
 yolo_mode = true   # Enable --yolo (bypass approvals and sandbox)
 env_file = "~/.codex.env"
 command = "codex"
+use_happy = false  # Launch Codex via happy codex
 ```
 
 | Key | Type | Default | Description |
@@ -183,6 +185,7 @@ command = "codex"
 | `yolo_mode` | bool | `false` | Maps to `codex --yolo` (`--dangerously-bypass-approvals-and-sandbox`). Can be overridden per-session. |
 | `env_file` | string | `""` | A .env file sourced for Codex sessions only. See [Path Resolution](#path-resolution). |
 | `command` | string | `"codex"` | Override the binary/invocation. |
+| `use_happy` | bool | `false` | Launch built-in Codex sessions via `happy codex`. Can be overridden per-session. |
 
 ## [copilot] Section
 
@@ -578,6 +581,7 @@ ignore_missing_env_files = true
 
 [claude]
 config_dir = "~/.claude"
+use_happy = false
 dangerous_mode = true
 env_file = "~/.claude.env"
 
@@ -603,6 +607,7 @@ env_file = "~/.copilot.env"
 command = "hermes --model gpt-5.5-pro --provider openai"
 env_file = "~/.hermes.env"
 yolo_mode = false
+use_happy = false
 
 [docker]
 default_enabled = false

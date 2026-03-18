@@ -5740,9 +5740,9 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			persistClaudeDialogDefaults(claudeOpts, claudeExtraArgs)
 			claudeStartQuery = h.newDialog.GetClaudeStartQuery()
 		} else if command == "codex" {
-			yolo := h.newDialog.GetCodexYoloMode()
-			codexOpts := &session.CodexOptions{YoloMode: &yolo}
-			toolOptionsJSON, _ = session.MarshalToolOptions(codexOpts)
+			if codexOpts := h.newDialog.GetCodexOptions(); codexOpts != nil {
+				toolOptionsJSON, _ = session.MarshalToolOptions(codexOpts)
+			}
 		}
 
 		parentSessionID := h.newDialog.GetParentSessionID()
