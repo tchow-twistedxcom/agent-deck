@@ -1412,13 +1412,6 @@ func (s *Session) Start(command string) error {
 	// Idempotent: only append terminal-features if not already present
 	ensureTerminalFeatures("hyperlinks", "extkeys")
 
-	// Bind Ctrl+Q to detach at the tmux level as fallback for terminals where
-	// XON/XOFF flow control intercepts the key before it reaches the PTY stdin
-	// reader (e.g. iTerm2 on macOS). Only binds on agentdeck-managed sessions.
-	_ = exec.Command("tmux", "bind-key", "-n", "-T", "root", "C-q",
-		"if-shell", fmt.Sprintf("[ \"#{session_name}\" = \"%s\" ]", s.Name),
-		"detach-client", "").Run()
-
 	// Apply user-specified tmux option overrides from config (after defaults).
 	// These are batched into a single call when multiple overrides are present.
 	if len(s.OptionOverrides) > 0 {
