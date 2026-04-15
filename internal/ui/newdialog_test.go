@@ -1410,7 +1410,7 @@ func TestNewDialog_Validate_EmptyName_UsesGeneratedName(t *testing.T) {
 
 func TestNewDialog_ShowInGroup_SetsGeneratedName(t *testing.T) {
 	d := NewNewDialog()
-	d.ShowInGroup("default", "default", "")
+	d.ShowInGroup("default", "default", "", nil, "")
 
 	if d.generatedName == "" {
 		t.Error("generatedName should be set after ShowInGroup")

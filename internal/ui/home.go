@@ -3284,19 +3284,6 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-	case branchPickerResultMsg:
-		if h.newDialog.IsVisible() {
-			var cmd tea.Cmd
-			h.newDialog, cmd = h.newDialog.Update(msg)
-			return h, cmd
-		}
-		if h.forkDialog.IsVisible() {
-			var cmd tea.Cmd
-			h.forkDialog, cmd = h.forkDialog.Update(msg)
-			return h, cmd
-		}
-		return h, nil
-
 	case sessionCreatedMsg:
 		// Remove the creating placeholder (if any) — always, on success or error
 		if msg.tempID != "" {
@@ -4675,9 +4662,9 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if command == "claude" && claudeOpts != nil {
 			toolOptionsJSON, _ = session.MarshalToolOptions(claudeOpts)
 		} else if command == "codex" {
-			if codexOpts := h.newDialog.GetCodexOptions(); codexOpts != nil {
-				toolOptionsJSON, _ = session.MarshalToolOptions(codexOpts)
-			}
+			yolo := h.newDialog.GetCodexYoloMode()
+			codexOpts := &session.CodexOptions{YoloMode: &yolo}
+			toolOptionsJSON, _ = session.MarshalToolOptions(codexOpts)
 		}
 
 		parentSessionID := h.newDialog.GetParentSessionID()

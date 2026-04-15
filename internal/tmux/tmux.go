@@ -1407,10 +1407,9 @@ func (s *Session) Start(command string) error {
 		"set-option", "-t", s.Name, "-q", "allow-passthrough", "on", ";",
 		"set-option", "-t", s.Name, "set-clipboard", "on", ";",
 		"set-option", "-t", s.Name, "escape-time", "10", ";",
-		"set-option", "-t", s.Name, "-q", "extended-keys", "on").Run()
-
-	// Idempotent: only append terminal-features if not already present
-	ensureTerminalFeatures("hyperlinks", "extkeys")
+		"set", "-sq", "extended-keys", "on", ";",
+		"set", "-asq", "terminal-features", ",*:hyperlinks:extkeys")
+	_ = exec.Command("tmux", startArgs...).Run()
 
 	// Apply user-specified tmux option overrides from config (after defaults).
 	// These are batched into a single call when multiple overrides are present.
@@ -1568,30 +1567,6 @@ func (s *Session) ConfigureStatusBar() {
 	_ = exec.Command("tmux", args...).Run()
 }
 
-// ensureTerminalFeatures appends terminal features only if not already present.
-// This prevents the terminal-features list from growing on every session start (#366).
-func ensureTerminalFeatures(features ...string) {
-	out, err := exec.Command("tmux", "show", "-sv", "terminal-features").Output()
-	if err != nil {
-		// tmux too old or server not running — append unconditionally as best-effort
-		if len(features) > 0 {
-			val := ",*:" + strings.Join(features, ":")
-			_ = exec.Command("tmux", "set", "-asq", "terminal-features", val).Run()
-		}
-		return
-	}
-	existing := string(out)
-	var missing []string
-	for _, f := range features {
-		if !strings.Contains(existing, f) {
-			missing = append(missing, f)
-		}
-	}
-	if len(missing) > 0 {
-		val := ",*:" + strings.Join(missing, ":")
-		_ = exec.Command("tmux", "set", "-asq", "terminal-features", val).Run()
-	}
-}
 
 // EnableMouseMode enables mouse scrolling, clipboard integration, and optimal settings
 // Safe to call multiple times - just sets the options again
@@ -1634,13 +1609,11 @@ func (s *Session) EnableMouseMode() error {
 		"set-option", "-t", s.Name, "set-clipboard", "on", ";",
 		"set-option", "-t", s.Name, "-q", "allow-passthrough", "on", ";",
 		"set-option", "-t", s.Name, "escape-time", "10", ";",
-		"set-option", "-t", s.Name, "-q", "extended-keys", "on")
+		"set", "-sq", "extended-keys", "on", ";",
+		"set", "-asq", "terminal-features", ",*:hyperlinks:extkeys")
 	// Ignore errors - all these are non-fatal enhancements
 	// Older tmux versions may not support some options
 	_ = enhanceCmd.Run()
-
-	// Idempotent: only append terminal-features if not already present
-	ensureTerminalFeatures("hyperlinks", "extkeys")
 
 	return nil
 }
