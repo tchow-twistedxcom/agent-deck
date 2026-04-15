@@ -4353,9 +4353,10 @@ func (i *Instance) buildClaudeForkCommandForTarget(target *Instance, opts *Claud
 		return "", fmt.Errorf("cannot fork: no active Claude session")
 	}
 
-	// Validate that the session we're about to fork has actual conversation data.
-	// This prevents "No conversation found" errors from corrupted session IDs.
-	if !sessionHasConversationData(i.ClaudeSessionID, i.ProjectPath) {
+	// Validate that the session we're about to fork isn't an auxiliary/cache file
+	// masquerading as a conversation. Only block if the file is found but empty —
+	// a missing file is handled by Claude itself.
+	if sessionFileFoundButEmpty(i.ClaudeSessionID, i.ProjectPath) {
 		return "", fmt.Errorf("cannot fork: session %s has no conversation data (may be corrupted)", i.ClaudeSessionID)
 	}
 
@@ -5014,6 +5015,32 @@ func sessionHasConversationData(sessionID string, projectPath string) bool {
 	// No sessionId found - session was never interacted with
 	sessionLog.Debug("session_data_no_session_id", slog.String("result", "use_session_id"))
 	return false
+}
+
+// sessionFileFoundButEmpty returns true only when the session file is found on disk but
+// contains no conversation data (auxiliary/cache file scenario). Returns false if the
+// file simply doesn't exist — that is a missing file, not a corruption.
+func sessionFileFoundButEmpty(sessionID string, projectPath string) bool {
+	configDir := GetClaudeConfigDir()
+	if configDir == "" {
+		configDir = filepath.Join(os.Getenv("HOME"), ".claude")
+	}
+	resolvedPath := projectPath
+	if resolved, err := filepath.EvalSymlinks(projectPath); err == nil {
+		resolvedPath = resolved
+	}
+	encodedPath := ConvertToClaudeDirName(resolvedPath)
+	if encodedPath == "" {
+		encodedPath = "-"
+	}
+	sessionFile := filepath.Join(configDir, "projects", encodedPath, sessionID+".jsonl")
+	if _, err := os.Stat(sessionFile); os.IsNotExist(err) {
+		if fallbackPath := findSessionFileInAllProjects(sessionID); fallbackPath == "" {
+			return false // File doesn't exist at all - not corrupted, just missing
+		}
+	}
+	// File exists somewhere - check if it has conversation data
+	return !sessionHasConversationData(sessionID, projectPath)
 }
 
 // findSessionFileInAllProjects searches all Claude project directories for a session file
