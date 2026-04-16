@@ -5578,10 +5578,15 @@ func (i *Instance) buildClaudeResumeCommand() string {
 	// shell environment as freshly started ones (fixes #409).
 	envPrefix := i.buildEnvSourceCommand()
 
-	// Get the configured Claude command (e.g., "claude", "cdw", "cdp")
-	// If a custom command is set, we skip CLAUDE_CONFIG_DIR prefix since the alias handles it
-	claudeCmd := GetClaudeCommand()
-	hasCustomCommand := claudeCmd != "claude"
+	// Get per-session permission settings (falls back to config if not persisted)
+	opts := i.GetClaudeOptions()
+	if opts == nil {
+		userConfig, _ := LoadUserConfig()
+		opts = NewClaudeOptions(userConfig)
+	}
+
+	// Resolve the Claude launch command, respecting happy wrapper and custom commands.
+	claudeCmd, hasCustomCommand := resolveClaudeLaunchCommand(opts)
 
 	// Resolve CLAUDE_CONFIG_DIR for this restart. Mirrors the gating logic
 	// in buildClaudeCommandWithMessage: we inject only when an explicit
@@ -5601,13 +5606,9 @@ func (i *Instance) buildClaudeResumeCommand() string {
 	// can identify which agent-deck session they belong to.
 	instanceIDPrefix := fmt.Sprintf("AGENTDECK_INSTANCE_ID=%s ", i.ID)
 	configDirPrefix = instanceIDPrefix + configDirPrefix
-
-	// Get per-session permission settings (falls back to config if not persisted)
-	opts := i.GetClaudeOptions()
-	if opts == nil {
-		userConfig, _ := LoadUserConfig()
-		opts = NewClaudeOptions(userConfig)
-	}
+	dangerousMode := opts.SkipPermissions
+	autoMode := opts.AutoMode
+	allowDangerousMode := opts.AllowSkipPermissions
 
 	// Check if session has actual conversation data.
 	// If not, use --session-id instead of --resume to avoid "No conversation found" error.
