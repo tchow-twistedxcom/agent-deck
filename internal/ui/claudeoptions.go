@@ -359,12 +359,16 @@ func (p *ClaudeOptionsPanel) getFocusType() string {
 		if idx == 2 {
 			return "skipPermissions"
 		}
-		// 4: chrome
+		// 4: auto mode
 		if idx == 3 {
+			return "autoMode"
+		}
+		// 5: chrome
+		if idx == 4 {
 			return "chrome"
 		}
-		// 5: teammate mode
-		if idx == 4 {
+		// 6: teammate mode
+		if idx == 5 {
 			return "teammateMode"
 		}
 		// 6: extra-args input

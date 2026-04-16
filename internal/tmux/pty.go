@@ -60,6 +60,7 @@ func IndexDetachKey(data []byte, detachByte byte) int {
 	return -1
 }
 
+
 // IndexCtrlQ returns the index of a Ctrl+Q sequence in data, or -1 if not found.
 // This is a convenience wrapper around IndexDetachKey with the default Ctrl+Q byte.
 func IndexCtrlQ(data []byte) int {
