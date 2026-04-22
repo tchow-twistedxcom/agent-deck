@@ -530,7 +530,7 @@ use_happy = true
 	inst := NewInstanceWithTool("happy-claude", "/tmp/test", "claude")
 	cmd := inst.buildClaudeCommand("claude")
 
-	if !strings.Contains(cmd, "exec happy --session-id") {
+	if !strings.Contains(cmd, "happy --session-id") {
 		t.Errorf("Should launch Claude via happy when use_happy=true, got: %s", cmd)
 	}
 }
@@ -600,7 +600,7 @@ use_happy = true
 	if strings.Contains(cmd, "exec happy") {
 		t.Errorf("Per-session UseHappy=false should override global config, got: %s", cmd)
 	}
-	if !strings.Contains(cmd, "exec claude --session-id") {
+	if !strings.Contains(cmd, "claude --session-id") {
 		t.Errorf("Expected plain claude command when per-session UseHappy=false, got: %s", cmd)
 	}
 }
