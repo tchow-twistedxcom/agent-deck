@@ -5606,9 +5606,6 @@ func (i *Instance) buildClaudeResumeCommand() string {
 	// can identify which agent-deck session they belong to.
 	instanceIDPrefix := fmt.Sprintf("AGENTDECK_INSTANCE_ID=%s ", i.ID)
 	configDirPrefix = instanceIDPrefix + configDirPrefix
-	dangerousMode := opts.SkipPermissions
-	autoMode := opts.AutoMode
-	allowDangerousMode := opts.AllowSkipPermissions
 
 	// Check if session has actual conversation data.
 	// If not, use --session-id instead of --resume to avoid "No conversation found" error.
@@ -6613,7 +6610,7 @@ func symlinkSessionForWorktree(sessionID, originalPath, worktreePath string) err
 	// Verify source exists
 	if _, err := os.Stat(sourceFile); os.IsNotExist(err) {
 		// Try cross-project search as fallback
-		if fallback := findSessionFileInAllProjects(sessionID); fallback != "" {
+		if fallback := findSessionFileInAllProjects(nil, sessionID); fallback != "" {
 			sourceFile = fallback
 		} else {
 			return fmt.Errorf("parent session file not found: %s", sourceFile)
@@ -6797,12 +6794,12 @@ func sessionFileFoundButEmpty(sessionID string, projectPath string) bool {
 	}
 	sessionFile := filepath.Join(configDir, "projects", encodedPath, sessionID+".jsonl")
 	if _, err := os.Stat(sessionFile); os.IsNotExist(err) {
-		if fallbackPath := findSessionFileInAllProjects(sessionID); fallbackPath == "" {
+		if fallbackPath := findSessionFileInAllProjects(nil, sessionID); fallbackPath == "" {
 			return false // File doesn't exist at all - not corrupted, just missing
 		}
 	}
 	// File exists somewhere - check if it has conversation data
-	return !sessionHasConversationData(sessionID, projectPath)
+	return !sessionHasConversationData(nil, sessionID)
 }
 
 // findSessionFileInAllProjects searches all Claude project directories for a session file
