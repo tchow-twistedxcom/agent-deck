@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -1027,11 +1028,11 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 
 	}
 
-	// Remove any stale C-q root binding left by a previous agent-deck run.
-	// A -T root C-q binding intercepts the key before it reaches the PTY stdin
-	// reader, silently eating Ctrl+Q and breaking detach. Unbind on every startup
-	// so old server state never survives across restarts.
-	_ = exec.Command("tmux", "unbind-key", "-T", "root", "C-q").Run()
+	// Clear AGENTDECK_PROFILE from the tmux global environment on startup.
+	// The tmux server process can inherit this from a previous agent-deck run with
+	// a non-default profile, causing every new shell in every session to inherit
+	// it. Clearing it here ensures managed sessions don't pick up a stale profile.
+	_ = exec.Command("tmux", "set-environment", "-g", "-u", "AGENTDECK_PROFILE").Run()
 
 	// Bind mouse click on status-right to detach (click the "ctrl+q/click detach" hint)
 	// This is unconditional — the status-right always shows the detach hint
