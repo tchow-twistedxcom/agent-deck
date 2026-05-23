@@ -371,12 +371,12 @@ func (p *ClaudeOptionsPanel) getFocusType() string {
 		if idx == 5 {
 			return "teammateMode"
 		}
-		// 6: extra-args input
-		if idx == 5 {
+		// 7: extra-args input
+		if idx == 6 {
 			return "extraArgsInput"
 		}
-		// 7: start-query input (v1.7.67)
-		if idx == 6 {
+		// 8: start-query input (v1.7.67)
+		if idx == 7 {
 			return "startQueryInput"
 		}
 	}
@@ -389,7 +389,7 @@ func (p *ClaudeOptionsPanel) getFocusCount() int {
 		return 4 // skip, auto, chrome, teammate
 	}
 
-	count := 7 // session mode, skip, auto, chrome, teammate, extra-args, start-query
+	count := 8 // session mode, useHappy, skip, auto, chrome, teammate, extra-args, start-query
 	if p.sessionMode == 2 {
 		count++ // resume input
 	}
@@ -407,9 +407,9 @@ func (p *ClaudeOptionsPanel) isExtraArgsInputFocused() bool {
 	if p.isForkMode {
 		return false
 	}
-	want := 5 // default: session(0) + skip(1) + auto(2) + chrome(3) + teammate(4) + extraArgs(5)
+	want := 6 // default: session(0) + useHappy(1) + skip(2) + auto(3) + chrome(4) + teammate(5) + extraArgs(6)
 	if p.sessionMode == 2 {
-		want = 6 // resume input inserts between session and skip
+		want = 7 // resume input inserts between session and useHappy
 	}
 	return p.focusIndex == want
 }
@@ -421,9 +421,9 @@ func (p *ClaudeOptionsPanel) isStartQueryInputFocused() bool {
 	if p.isForkMode {
 		return false
 	}
-	want := 6 // default: after extraArgs(5)
+	want := 7 // default: after extraArgs(6)
 	if p.sessionMode == 2 {
-		want = 7 // resume input adds one
+		want = 8 // resume input adds one
 	}
 	return p.focusIndex == want
 }

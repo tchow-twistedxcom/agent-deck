@@ -60,7 +60,6 @@ func IndexDetachKey(data []byte, detachByte byte) int {
 	return -1
 }
 
-
 // IndexCtrlQ returns the index of a Ctrl+Q sequence in data, or -1 if not found.
 // This is a convenience wrapper around IndexDetachKey with the default Ctrl+Q byte.
 func IndexCtrlQ(data []byte) int {
@@ -199,6 +198,14 @@ func (s *Session) Attach(ctx context.Context, detachByte ...byte) error {
 		return fmt.Errorf("failed to start pty: %w", err)
 	}
 	defer ptmx.Close()
+
+	// Set the PTY to raw mode so all bytes pass through transparently.
+	// Without this, the PTY's default terminal settings (ISIG enabled)
+	// interpret Ctrl+Z as SUSP and send SIGTSTP to the tmux attach process,
+	// causing it to exit and returning the user to the session list.
+	if _, err := term.MakeRaw(int(ptmx.Fd())); err != nil {
+		return fmt.Errorf("failed to set pty raw mode: %w", err)
+	}
 
 	// Save original terminal state and set raw mode
 	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
