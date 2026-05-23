@@ -3312,6 +3312,9 @@ use_happy = true
 		t.Fatalf("SetCodexOptions failed: %v", err)
 	}
 
+	// Create a fake rollout file so the session ID is not cleared by the stale-ID check.
+	writeFakeCodexRollout(t, filepath.Join(tmpDir, ".codex"), inst.CodexSessionID)
+
 	cmd := inst.buildCodexCommand("codex")
 
 	if strings.Contains(cmd, "happy codex") {
