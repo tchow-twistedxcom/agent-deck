@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -1032,13 +1031,15 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 	// agent-deck run on a server without socket isolation could leave a binding
 	// that silently eats Ctrl+Q, preventing the PTY loop's IndexDetachKey from
 	// firing. Unbind on every startup so stale server state never survives restarts.
-	_ = exec.Command("tmux", "unbind-key", "-T", "root", "C-q").Run()
+	// Route through tmux.Exec (the sanctioned factory) rather than raw exec.Command
+	// so the socket-isolation lint stays green; "" targets the user's default server.
+	_ = tmux.Exec("", "unbind-key", "-T", "root", "C-q").Run()
 
 	// Clear AGENTDECK_PROFILE from the tmux global environment on startup.
 	// The tmux server process can inherit this from a previous agent-deck run with
 	// a non-default profile, causing every new shell in every session to inherit
 	// it. Clearing it here ensures managed sessions don't pick up a stale profile.
-	_ = exec.Command("tmux", "set-environment", "-g", "-u", "AGENTDECK_PROFILE").Run()
+	_ = tmux.Exec("", "set-environment", "-g", "-u", "AGENTDECK_PROFILE").Run()
 
 	// Bind mouse click on status-right to detach (click the "ctrl+q/click detach" hint)
 	// This is unconditional — the status-right always shows the detach hint
