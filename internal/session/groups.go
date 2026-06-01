@@ -132,6 +132,38 @@ func SortInstancesByActionable(insts []*Instance) {
 	})
 }
 
+// SortInstancesByOrder sorts the given slice in place purely by the persisted
+// manual Order field. This is the stable fallback used when the actionable
+// sort (issue #857) is disabled via [display] sort_by_actionable = false:
+// sessions keep the position the user set and never reshuffle on status
+// changes or attach/detach.
+func SortInstancesByOrder(insts []*Instance) {
+	sort.SliceStable(insts, func(i, j int) bool {
+		return insts[i].Order < insts[j].Order
+	})
+}
+
+// sortByActionable gates the in-group sort. Defaults to true (upstream issue
+// #857 behavior). Set once at startup from config via SetSortByActionable so
+// the many NewGroupTree/NewGroupTreeWithGroups call sites (TUI, web, CLI) need
+// no signature change and pay no per-call config I/O.
+var sortByActionable = true
+
+// SetSortByActionable toggles whether NewGroupTree[WithGroups] re-sorts each
+// group by actionability (true) or keeps the manual Order (false). Call once
+// at startup, and again when the user changes the setting at runtime.
+func SetSortByActionable(v bool) { sortByActionable = v }
+
+// sortGroupSessions applies the in-group sort selected by the sortByActionable
+// toggle.
+func sortGroupSessions(insts []*Instance) {
+	if sortByActionable {
+		SortInstancesByActionable(insts)
+	} else {
+		SortInstancesByOrder(insts)
+	}
+}
+
 // NewGroupTree creates a new group tree from instances
 func NewGroupTree(instances []*Instance) *GroupTree {
 	tree := &GroupTree{
@@ -172,7 +204,7 @@ func NewGroupTree(instances []*Instance) *GroupTree {
 	// instances without a Status set behave identically to the prior
 	// Order-only sort.
 	for _, group := range tree.Groups {
-		SortInstancesByActionable(group.Sessions)
+		sortGroupSessions(group.Sessions)
 	}
 
 	// Sort groups alphabetically and assign order
@@ -242,7 +274,7 @@ func NewGroupTreeWithGroups(instances []*Instance, storedGroups []*GroupData) *G
 	// instances without a Status set behave identically to the prior
 	// Order-only sort.
 	for _, group := range tree.Groups {
-		SortInstancesByActionable(group.Sessions)
+		sortGroupSessions(group.Sessions)
 	}
 
 	// Rebuild group list maintaining stored order

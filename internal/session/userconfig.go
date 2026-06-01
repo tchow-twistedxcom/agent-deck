@@ -1805,6 +1805,16 @@ type DisplaySettings struct {
 	// Valid statuses: "running", "waiting", "idle", "error", "starting",
 	// "stopped".
 	ActiveFilterExcludes []string `toml:"active_filter_excludes"`
+
+	// SortByActionable controls whether sessions within a group are re-sorted
+	// by "actionability" (issue #857): error > waiting > running > idle >
+	// stopped, then most-recently-accessed, then manual Order. This makes
+	// sessions move up/down the list as their status changes or on
+	// attach/detach. Set to false to keep sessions in a fixed manual Order
+	// (the position you set via reorder), so they never jump around.
+	// Pointer so an absent key defaults to true (preserves upstream behavior).
+	// Default: true.
+	SortByActionable *bool `toml:"sort_by_actionable"`
 }
 
 // GetActiveFilterExcludes returns the resolved set of statuses the % filter
@@ -1850,6 +1860,16 @@ func (d DisplaySettings) GetDefaultFilter() string {
 		return d.DefaultFilter
 	}
 	return ""
+}
+
+// GetSortByActionable returns whether the in-group "actionable" sort (issue
+// #857) is active, defaulting to true (the upstream behavior). When false,
+// sessions stay in their manual Order and do not reshuffle on status changes.
+func (d DisplaySettings) GetSortByActionable() bool {
+	if d.SortByActionable == nil {
+		return true // Default: actionable sort ON
+	}
+	return *d.SortByActionable
 }
 
 // GetFullRepaint returns whether full-repaint mode is active, checking

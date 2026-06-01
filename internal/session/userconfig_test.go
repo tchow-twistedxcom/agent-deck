@@ -2066,3 +2066,46 @@ active_filter_excludes = ["error", "stopped"]
 		t.Errorf("running should not be excluded, got %v", got)
 	}
 }
+
+// TestGetSortByActionable covers the *bool default (absent => true) and the
+// explicit values for the issue #857 in-group sort off switch.
+func TestGetSortByActionable(t *testing.T) {
+	tru, fls := true, false
+	tests := []struct {
+		name string
+		in   *bool
+		want bool
+	}{
+		{"nil defaults to true (actionable sort on)", nil, true},
+		{"explicit true", &tru, true},
+		{"explicit false (manual Order)", &fls, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := DisplaySettings{SortByActionable: tt.in}
+			if got := d.GetSortByActionable(); got != tt.want {
+				t.Errorf("GetSortByActionable() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestGetSortByActionable_TomlRoundtrip verifies the TOML tag wires up: the key
+// parses to false, and an absent key defaults to true (current behavior).
+func TestGetSortByActionable_TomlRoundtrip(t *testing.T) {
+	var off UserConfig
+	if _, err := toml.Decode("[display]\nsort_by_actionable = false\n", &off); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if off.Display.GetSortByActionable() {
+		t.Error("sort_by_actionable = false should disable the actionable sort")
+	}
+
+	var absent UserConfig
+	if _, err := toml.Decode("[display]\nfull_repaint = false\n", &absent); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !absent.Display.GetSortByActionable() {
+		t.Error("absent sort_by_actionable should default to true")
+	}
+}

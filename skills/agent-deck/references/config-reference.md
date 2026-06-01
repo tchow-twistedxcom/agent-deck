@@ -347,6 +347,7 @@ full_repaint = false                              # Force full screen clear ever
 default_filter = "active"                         # Initial status filter: "", "active", "running", "waiting", "idle", "error"
 active_filter_label = "Open"                      # Label for the active filter pill (default: "Open")
 active_filter_excludes = ["error", "stopped"]     # Statuses the % "Open" filter hides (default: ["error", "stopped"])
+sort_by_actionable = true                         # Re-sort each group by actionability (default true); false = keep manual Order
 ```
 
 | Key | Type | Default | Description |
@@ -354,7 +355,8 @@ active_filter_excludes = ["error", "stopped"]     # Statuses the % "Open" filter
 | `full_repaint` | bool | `false` | Force full redraws (fix for Ghostty 1.3+ drift). Also via `AGENTDECK_REPAINT=full`. |
 | `default_filter` | string | `""` | Status filter applied on TUI startup. `"active"` engages the configurable Open filter. Auto-clears if no sessions match. |
 | `active_filter_label` | string | `"Open"` | Label shown on the filter pill when active filter is engaged (e.g., "Active", "Live", "Open"). |
-| `active_filter_excludes` | []string | `["error", "stopped"]` | Statuses hidden when the `%` "Open" filter is engaged. Default matches the original hardcoded behavior. Valid values: `running`, `waiting`, `idle`, `error`, `starting`, `stopped`. Unknown entries are dropped silently; if the resulting list is empty the default applies. **Set to `["error"]`** to keep stopped/closed sessions visible while still hiding errors — fixes the over-broad "Open" semantics where closed sessions disappeared from view. Extend with `idle` for an aggressive "show only running/waiting" definition of open. |
+| `active_filter_excludes` | []string | `["error", "stopped"]` | Statuses hidden when the `%` "Open" filter is engaged. Default matches the original hardcoded behavior. Valid values: `running`, `waiting`, `idle`, `error`, `starting`, `stopped`. Unknown entries are dropped silently; if the resulting list is empty the default applies. **Set to `["error"]`** to keep stopped/closed sessions visible while still hiding errors, fixes the over-broad "Open" semantics where closed sessions disappeared from view. Extend with `idle` for an aggressive "show only running/waiting" definition of open. |
+| `sort_by_actionable` | bool | `true` | Re-sort sessions within each group by "actionability" (issue #857): error > waiting > running > idle > stopped, then most-recently-accessed, then manual `Order`. This makes sessions move up/down the list as their status changes or on attach/detach. **Set to `false`** to keep sessions in a fixed manual `Order` (the position you set when reordering) so they never jump around. |
 
 ## [global_search] Section
 

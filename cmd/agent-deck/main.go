@@ -219,6 +219,16 @@ func main() {
 	// the installation-wide fallback for callers without a session handle.
 	tmux.SetDefaultSocketName(session.GetTmuxSettings().GetSocketName())
 
+	// Seed the in-group session sort mode once per process from config
+	// ([display] sort_by_actionable, issue #857). Controls whether
+	// NewGroupTree[WithGroups] re-sorts each group by actionability (default)
+	// or keeps the user's manual Order so sessions never reshuffle. Covers the
+	// TUI, all CLI subcommands, and the in-process web menu builder; the TUI
+	// re-applies it on config reload.
+	if cfg, _ := session.LoadUserConfig(); cfg != nil {
+		session.SetSortByActionable(cfg.Display.GetSortByActionable())
+	}
+
 	// Nudge macOS users whose tmux predates the upstream fix for the
 	// control-mode NULL-deref (tmux #4980, issue #737). Once per process,
 	// no-op on non-macOS, suppressible via AGENTDECK_SUPPRESS_TMUX_WARNING.

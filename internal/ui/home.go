@@ -975,6 +975,10 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 	// reused on every render; see (*Home).renderStats.
 	if cfg, _ := session.LoadUserConfig(); cfg != nil {
 		h.fullRepaint = cfg.Display.GetFullRepaint()
+		// Apply the in-group sort mode (issue #857) alongside the other
+		// [display] settings. main() already seeds it process-wide; setting it
+		// here keeps the TUI self-contained and correct on any construction path.
+		session.SetSortByActionable(cfg.Display.GetSortByActionable())
 		h.defaultFilter = cfg.Display.GetDefaultFilter()
 		h.activeFilterLabel = cfg.Display.ActiveFilterLabel
 		h.activeFilterExcludes = cfg.Display.GetActiveFilterExcludes()

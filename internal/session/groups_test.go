@@ -2059,3 +2059,44 @@ func TestDemoteSession_WithChildrenNoOp(t *testing.T) {
 		t.Errorf("p2's children should be unchanged; got %v, want %v", gotKids, wantKids)
 	}
 }
+
+// TestSortByActionableToggle verifies the [display] sort_by_actionable off
+// switch: when enabled (default, issue #857) the most actionable session
+// surfaces first; when disabled, sessions keep their manual Order regardless
+// of status so they never reshuffle.
+func TestSortByActionableToggle(t *testing.T) {
+	// sortByActionable is a package global; save and restore so this test does
+	// not leak its setting into others.
+	prev := sortByActionable
+	defer func() { sortByActionable = prev }()
+
+	// Two sessions in one group whose Order and actionability disagree:
+	//   idle  has the lower Order (0) but is the LEAST actionable
+	//   error has the higher Order (1) but is the MOST actionable
+	newInstances := func() []*Instance {
+		return []*Instance{
+			{ID: "idle", Title: "idle", GroupPath: "work", Order: 0, Status: StatusIdle},
+			{ID: "error", Title: "error", GroupPath: "work", Order: 1, Status: StatusError},
+		}
+	}
+
+	ids := func(tree *GroupTree) []string {
+		var out []string
+		for _, s := range tree.Groups["work"].Sessions {
+			out = append(out, s.ID)
+		}
+		return out
+	}
+
+	// ON (default): error (most actionable) surfaces first.
+	SetSortByActionable(true)
+	if got := ids(NewGroupTree(newInstances())); got[0] != "error" || got[1] != "idle" {
+		t.Errorf("actionable ON: want [error idle], got %v", got)
+	}
+
+	// OFF: manual Order wins; idle (Order 0) stays first, no reshuffle on status.
+	SetSortByActionable(false)
+	if got := ids(NewGroupTree(newInstances())); got[0] != "idle" || got[1] != "error" {
+		t.Errorf("actionable OFF: want [idle error] (manual Order), got %v", got)
+	}
+}
