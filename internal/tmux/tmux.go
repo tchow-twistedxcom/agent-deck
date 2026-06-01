@@ -1966,10 +1966,15 @@ func (s *Session) Start(command string) error {
 
 	// Bind Ctrl+Q to detach at the tmux level as fallback for terminals where
 	// XON/XOFF flow control intercepts the key before it reaches the PTY stdin
-	// reader (e.g. iTerm2 on macOS). Only binds on agentdeck-managed sessions.
-	_ = s.tmuxCmd("bind-key", "-n", "-T", "root", "C-q",
-		"if-shell", fmt.Sprintf("[ \"#{session_name}\" = \"%s\" ]", s.Name),
-		"detach-client", "").Run()
+	// reader (e.g. iTerm2 on macOS). Only bind when socket isolation is active:
+	// on a shared default tmux server this binding eats Ctrl+Q from ALL sessions
+	// including the user's wrapper session, preventing the PTY loop's own
+	// IndexDetachKey handler from ever seeing the byte.
+	if s.SocketName != "" {
+		_ = s.tmuxCmd("bind-key", "-n", "-T", "root", "C-q",
+			"if-shell", fmt.Sprintf("[ \"#{session_name}\" = \"%s\" ]", s.Name),
+			"detach-client", "").Run()
+	}
 
 	// Apply user-specified tmux option overrides from config (after defaults).
 	// These are batched into a single call when multiple overrides are present.

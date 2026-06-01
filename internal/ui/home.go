@@ -1028,6 +1028,12 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 
 	}
 
+	// Clear any stale C-q root binding on the default tmux server. A previous
+	// agent-deck run on a server without socket isolation could leave a binding
+	// that silently eats Ctrl+Q, preventing the PTY loop's IndexDetachKey from
+	// firing. Unbind on every startup so stale server state never survives restarts.
+	_ = exec.Command("tmux", "unbind-key", "-T", "root", "C-q").Run()
+
 	// Clear AGENTDECK_PROFILE from the tmux global environment on startup.
 	// The tmux server process can inherit this from a previous agent-deck run with
 	// a non-default profile, causing every new shell in every session to inherit
