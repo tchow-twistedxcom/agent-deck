@@ -105,7 +105,7 @@ jobs:
           fetch-depth: 0
           ref: custom/dev
 
-      - name: Check if custom/dev needs rebase
+      - name: Check if custom/dev needs upstream merge
         id: check
         run: |
           git fetch origin main
@@ -118,12 +118,12 @@ jobs:
           echo "behind=$BEHIND" >> $GITHUB_OUTPUT
           echo "ahead=$AHEAD" >> $GITHUB_OUTPUT
 
-      - name: Create rebase notification issue
+      - name: Create merge notification issue
         if: steps.check.outputs.behind != '0'
         uses: actions/github-script@v7
         with:
           script: |
-            const title = `🔄 custom/dev needs rebase (main synced to v${{ needs.sync-main.outputs.new_version }})`;
+            const title = `🔄 custom/dev needs upstream merge (main synced to v${{ needs.sync-main.outputs.new_version }})`;
             const body = `The \`main\` branch was automatically synced with upstream.
 
             ## Status
@@ -132,13 +132,15 @@ jobs:
             | \`main\` | ✅ Synced to v${{ needs.sync-main.outputs.new_version }} |
             | \`custom/dev\` | ⚠️ ${{ steps.check.outputs.behind }} commits behind main |
 
-            ## Rebase Instructions
+            ## Merge Instructions
+            custom/dev is maintained with merge-based upstream tracking (see FORK.md).
+            Do NOT rebase: the branch history contains upstream merge commits.
             \`\`\`bash
-            git fetch origin
+            git fetch upstream
             git checkout custom/dev
-            git rebase origin/main
-            # Resolve any conflicts if needed
-            git push origin custom/dev --force-with-lease
+            git merge upstream/main
+            # Resolve conflicts once; rerere replays previous resolutions
+            git push origin custom/dev
             \`\`\`
 
             ## What Changed
@@ -157,7 +159,7 @@ jobs:
               labels: 'upstream-sync'
             });
 
-            const existing = issues.data.find(i => i.title.includes('custom/dev needs rebase'));
+            const existing = issues.data.find(i => i.title.includes('custom/dev needs upstream merge') || i.title.includes('custom/dev needs rebase'));
             if (existing) {
               // Update existing issue
               await github.rest.issues.update({
@@ -184,4 +186,4 @@ jobs:
           echo "## 📊 custom/dev Status" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- **Ahead of main:** ${{ steps.check.outputs.ahead }} commits (custom changes)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Behind main:** ${{ steps.check.outputs.behind }} commits (needs rebase)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Behind main:** ${{ steps.check.outputs.behind }} commits (needs upstream merge)" >> $GITHUB_STEP_SUMMARY
