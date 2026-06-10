@@ -2233,13 +2233,15 @@ func (s *Session) ConfigureStatusBar() {
 
 // ensureTerminalFeatures appends terminal features only if not already present.
 // This prevents the terminal-features list from growing on every session start (#366).
-func ensureTerminalFeatures(features ...string) {
-	out, err := exec.Command("tmux", "show", "-sv", "terminal-features").Output()
+// Routed through s.tmuxCmd so the query and append hit the session's own server
+// (honors socket isolation, #687) instead of the user's default server.
+func (s *Session) ensureTerminalFeatures(features ...string) {
+	out, err := s.tmuxCmd("show", "-sv", "terminal-features").Output()
 	if err != nil {
 		// tmux too old or server not running — append unconditionally as best-effort
 		if len(features) > 0 {
 			val := ",*:" + strings.Join(features, ":")
-			_ = exec.Command("tmux", "set", "-asq", "terminal-features", val).Run()
+			_ = s.tmuxCmd("set", "-asq", "terminal-features", val).Run()
 		}
 		return
 	}
@@ -2252,7 +2254,7 @@ func ensureTerminalFeatures(features ...string) {
 	}
 	if len(missing) > 0 {
 		val := ",*:" + strings.Join(missing, ":")
-		_ = exec.Command("tmux", "set", "-asq", "terminal-features", val).Run()
+		_ = s.tmuxCmd("set", "-asq", "terminal-features", val).Run()
 	}
 }
 
@@ -2314,7 +2316,7 @@ func (s *Session) EnableMouseMode() error {
 	_ = enhanceCmd.Run()
 
 	// Idempotent: only append terminal-features if not already present
-	ensureTerminalFeatures("hyperlinks", "extkeys")
+	s.ensureTerminalFeatures("hyperlinks", "extkeys")
 
 	return nil
 }
