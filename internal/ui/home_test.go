@@ -264,8 +264,10 @@ func TestHomeUpdateResize(t *testing.T) {
 	if !ok {
 		t.Fatal("Update should return *Home")
 	}
-	if h.width != 120 {
-		t.Errorf("Width = %d, want 120", h.width)
+	// Fork: WindowSizeMsg reserves one column (msg.Width - 1) so padded
+	// rows stay narrower than the renderer width; see the handler comment.
+	if h.width != 119 {
+		t.Errorf("Width = %d, want 119 (msg.Width-1)", h.width)
 	}
 	if h.height != 40 {
 		t.Errorf("Height = %d, want 40", h.height)

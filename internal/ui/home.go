@@ -3898,7 +3898,13 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, h.performFinalShutdown(bool(msg))
 
 	case tea.WindowSizeMsg:
-		h.width = msg.Width
+		// Reserve one column: the final frame is padded to h.width per row
+		// (clampViewToViewport, #1252), and rows exactly equal to the
+		// renderer's width make Bubble Tea skip EraseLineRight, leaving
+		// stale rows from prior frames (duplicate group/header lines on
+		// scroll). Keeping content narrower than the renderer's stored
+		// width guarantees the erase is emitted for every row.
+		h.width = msg.Width - 1
 		h.height = msg.Height
 		h.updateSizes()
 		h.syncViewport() // Recalculate viewport when window size changes

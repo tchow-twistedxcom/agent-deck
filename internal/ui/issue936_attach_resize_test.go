@@ -70,8 +70,13 @@ func Test_Issue936_WindowSizeMsg_RebuildsViewport(t *testing.T) {
 	if !ok {
 		t.Fatalf("Update returned %T, want *Home", model)
 	}
-	if h.width != 80 {
-		t.Errorf("h.width = %d after WindowSizeMsg{80,24}, want 80 (cached pre-zoom dim survived)", h.width)
+	// Fork: the WindowSizeMsg handler reserves one column (h.width =
+	// msg.Width - 1) so padded full-width rows stay narrower than the
+	// renderer width and EraseLineRight is always emitted. The #936
+	// contract under test is unchanged: the cached pre-zoom dimension
+	// (120) must not survive the resize.
+	if h.width != 79 {
+		t.Errorf("h.width = %d after WindowSizeMsg{80,24}, want 79 (msg.Width-1; cached pre-zoom dim survived)", h.width)
 	}
 	if h.height != 24 {
 		t.Errorf("h.height = %d after WindowSizeMsg{80,24}, want 24 (cached pre-zoom dim survived)", h.height)
