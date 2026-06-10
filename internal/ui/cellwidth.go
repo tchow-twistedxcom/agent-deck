@@ -7,6 +7,106 @@ import (
 	"github.com/rivo/uniseg"
 )
 
+// termiusWideSymbols are codepoints that agent-deck (via ansi.StringWidth)
+// measures as 1 terminal cell, but that emoji-capable terminals built on
+// xterm.js (notably Termius, and mobile system-font terminals generally)
+// render with a 2-cell pictographic glyph through emoji-font fallback, even
+// without a U+FE0F variation selector and even when Unicode marks them
+// Emoji_Presentation=No.
+//
+// This set is deliberately limited to the emoji-class symbols agent-deck
+// actually renders in its persistent chrome (status bar, footer, badges,
+// selection/tree markers). It EXCLUDES glyphs proven or strongly expected to
+// stay 1 cell in those terminals: box-drawing and block elements (the 199-cell
+// separator line does not wrap, which proves these are 1 cell), the geometric
+// status dots ● ○ ◐ ■, the math angle brackets ⟨ ⟩, the bullet •, and the
+// dingbat X marks ✕ ✗. Counting any of those as 2 would over-truncate.
+//
+// Empirically grounded: on a 200-column Termius terminal the top status bar
+// (which agent-deck measures at 198 cells) wraps, and the arithmetic only
+// reaches >200 once ⚙ ⛁ ▪ are each counted as 2. See the width analysis in
+// the 2026-06-10 fix.
+var termiusWideSymbols = map[rune]bool{
+	0x2699: true, // ⚙ GEAR (CPU badge)
+	0x26C1: true, // ⛁ WHITE DRAUGHTS KING (memory badge)
+	0x21C5: true, // ⇅ UP/DOWN ARROW (network badge)
+	0x25AA: true, // ▪ BLACK SMALL SQUARE (disk badge)
+	0x2191: true, // ↑ UPWARDS ARROW (footer nav)
+	0x2193: true, // ↓ DOWNWARDS ARROW (footer nav)
+	0x2192: true, // → RIGHTWARDS ARROW
+	0x2190: true, // ← LEFTWARDS ARROW
+	0x2194: true, // ↔ LEFT RIGHT ARROW
+	0x2B06: true, // ⬆ UPWARDS BLACK ARROW (update nudge)
+	0x26A0: true, // ⚠ WARNING SIGN
+	0x25B6: true, // ▶ BLACK RIGHT-POINTING TRIANGLE (selection / tree marker)
+	0x23F1: true, // ⏱ STOPWATCH (last-update timestamp badge)
+}
+
+// terminalDrawWidth reports how many terminal cells s occupies when drawn by an
+// emoji-capable terminal that widens the termiusWideSymbols set to 2 cells. It
+// is ansi.StringWidth plus one extra cell per bare wide-symbol occurrence.
+//
+// Used by clampViewToViewport so the final emitted frame never produces a line
+// whose drawn width exceeds the viewport on such terminals: an over-wide line
+// wraps onto a second physical row, the frame grows past the terminal height,
+// the terminal scrolls, and rows duplicate at the top/bottom on every redraw
+// (the 2026-06-10 Termius report). On terminals that draw these glyphs at 1
+// cell (tmux, most desktop emulators) the only effect is a few cells of extra
+// right-edge slack on the rare line carrying these symbols, which is cosmetic.
+//
+// A wide symbol already followed by U+FE0F (emoji presentation) is skipped:
+// ansi.StringWidth already counts that cluster as 2, so adding more would
+// double-count. agent-deck's chrome uses these glyphs bare, so this guard is
+// belt-and-suspenders.
+func terminalDrawWidth(s string) int {
+	w := ansi.StringWidth(s)
+	plain := []rune(ansi.Strip(s))
+	for i, r := range plain {
+		if !termiusWideSymbols[r] {
+			continue
+		}
+		if i+1 < len(plain) && plain[i+1] == 0xFE0F {
+			continue
+		}
+		w++
+	}
+	return w
+}
+
+// terminalDrawTruncate returns a prefix of s whose terminalDrawWidth is <=
+// width, appending tail if truncation occurred. It mirrors cellTruncate but
+// budgets against terminalDrawWidth so the result fits emoji-widening
+// terminals. The surplus (terminalDrawWidth - ansi.StringWidth) of the whole
+// string is reserved up front; since a prefix can only contain fewer wide
+// symbols than the whole, the result is guaranteed within width:
+//
+//	terminalDrawWidth(out) = ansiWidth(out) + surplus(out)
+//	                      <= (width - surplus(s)) + surplus(out)
+//	                      <= width                  [surplus(out) <= surplus(s)]
+//
+// ansi.Truncate handles ANSI escape boundaries (never cuts mid-CSI, preserves
+// SGR state), so the #699 SGR-bleed invariant is kept.
+func terminalDrawTruncate(s string, width int, tail string) string {
+	if width <= 0 {
+		return ""
+	}
+	if terminalDrawWidth(s) <= width {
+		return s
+	}
+	surplus := terminalDrawWidth(s) - ansi.StringWidth(s)
+	budget := width - surplus
+	if budget < 0 {
+		budget = 0
+	}
+	out := ansi.Truncate(s, budget, tail)
+	if terminalDrawWidth(out) > width {
+		// Tail pushed it over; drop the tail. The prefix alone still
+		// satisfies the bound above.
+		out = ansi.Truncate(s, budget, "")
+	}
+	return out
+}
+
 // cellWidth reports the number of terminal cells that s occupies when rendered.
 //
 // History (#937 v2, @jennings, 2026-05-13). Earlier versions of

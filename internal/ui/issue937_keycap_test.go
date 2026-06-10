@@ -313,6 +313,32 @@ func Test_clampViewToViewport_TruncatesButNeverPads(t *testing.T) {
 	}
 }
 
+// Test_clampViewToViewport_TrimsEmojiWideRows is the 2026-06-10 Termius fix:
+// the clamp must measure rows by terminalDrawWidth (emoji-class symbols = 2
+// cells) so a row that fits by ansi.StringWidth but is drawn past the margin on
+// an emoji-capable terminal gets trimmed to one physical row. Otherwise it
+// wraps, the frame exceeds the terminal height, the terminal scrolls, and rows
+// duplicate. Mirrors the real top status bar: a near-full ASCII line carrying
+// the ⚙ ⛁ ▪ badges.
+func Test_clampViewToViewport_TrimsEmojiWideRows(t *testing.T) {
+	const width, height = 30, 1
+	// 27 ASCII + ⚙ ⛁ ▪ = ansi.StringWidth 30 (fits) but terminalDrawWidth 33
+	// (each badge +1) on Termius — must be trimmed so it fits one row there.
+	row := strings.Repeat("A", 27) + "⚙⛁▪"
+	if got := cellWidth(row); got != width {
+		t.Fatalf("precondition: ansi width = %d; want %d", got, width)
+	}
+	if got := terminalDrawWidth(row); got != width+3 {
+		t.Fatalf("precondition: terminalDrawWidth = %d; want %d", got, width+3)
+	}
+
+	out := clampViewToViewport(row, width, height)
+	line := strings.Split(out, "\n")[0]
+	if got := terminalDrawWidth(line); got > width {
+		t.Fatalf("clamped row terminalDrawWidth = %d; must be <= %d so it cannot wrap on an emoji terminal", got, width)
+	}
+}
+
 // Test_ensureExactWidth_PanelAlignment_Emoji locks the #182 contract that
 // PR #1240 broke: ensureExactWidth must equalize panel rows using the SAME
 // width basis lipgloss.JoinHorizontal uses internally — lipgloss.Width — so

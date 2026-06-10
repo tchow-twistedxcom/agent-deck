@@ -11769,25 +11769,33 @@ func clampViewToViewport(content string, width, height int) string {
 	}
 
 	for i, line := range lines {
-		// #937 v2: cellWidth/cellTruncate (not ansi.*) so this final
-		// viewport-clamp safety net sees keycap clusters at their true
-		// terminal cell count. Any line that slips past upstream gates
-		// with a #️⃣ 0️⃣–9️⃣ *️⃣ glyph would otherwise overflow into the
-		// next row here — exactly @jennings's pane-content drift report.
+		// Truncate by terminalDrawWidth, not cellWidth: emoji-capable
+		// terminals (Termius and other xterm.js / mobile system-font
+		// terminals) draw a set of emoji-class symbols (⚙ ⛁ ⇅ ▪, the nav
+		// arrows, ⚠ ⏱ ▶) at 2 cells while ansi.StringWidth measures them
+		// at 1. A line that fits by ansi measurement is then drawn past
+		// the right margin on those terminals, wraps onto a second
+		// physical row, pushes the frame past the terminal height, and the
+		// terminal scrolls — duplicating rows at the top/bottom on every
+		// redraw (2026-06-10 Termius report). Trimming to terminalDrawWidth
+		// keeps every row to one physical line everywhere; on terminals
+		// that draw those glyphs at 1 cell the only effect is a little
+		// right-edge slack on the rare line carrying them.
 		//
-		// Fork: truncate-only, deliberately NOT padding short lines to
-		// full width (upstream #1252 / f548343f). Padding turns any glyph
-		// the terminal draws wider than cellWidth measures it (emoji-class
-		// symbols like the ⚙ ⛁ ⇅ header badges on some emulators) into a
-		// hard wrap at the right margin, shifting the whole frame and
-		// duplicating rows at the top/bottom of the screen. Stale trailing
-		// glyphs (the iTerm2 ghost-line artifact #1252 padded against) are
-		// instead cleared by Bubble Tea's EraseLineRight, which is emitted
-		// for every row because unpadded rows measure narrower than the
-		// renderer's terminal width (guaranteed by the one-column reserve
-		// in the WindowSizeMsg handler).
-		if cellWidth(line) > width {
-			lines[i] = cellTruncate(line, width, "")
+		// #937 v2 keycap clusters are still handled: terminalDrawWidth /
+		// terminalDrawTruncate build on ansi.StringWidth / ansi.Truncate,
+		// which count keycaps as 2 cells natively (ansi 0.11.7).
+		//
+		// Fork: truncate-only, deliberately NOT padding short lines to full
+		// width (upstream #1252 / f548343f). Padding to the ansi-measured
+		// width is exactly what makes the wide-glyph lines overflow on
+		// emoji terminals. Stale trailing glyphs (the artifact #1252 padded
+		// against) are instead cleared by Bubble Tea's EraseLineRight,
+		// emitted for every row because unpadded rows measure narrower than
+		// the renderer's terminal width (the one-column reserve in the
+		// WindowSizeMsg handler).
+		if terminalDrawWidth(line) > width {
+			lines[i] = terminalDrawTruncate(line, width, "")
 		}
 	}
 
