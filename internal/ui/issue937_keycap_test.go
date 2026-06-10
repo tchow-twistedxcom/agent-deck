@@ -278,16 +278,23 @@ func Test_Issue937v2_CellTruncate_PreservesAnsiBoundariesAndKeycap(t *testing.T)
 	}
 }
 
-// Test_clampViewToViewport_PadsEveryRow guards the iTerm2 ghost-line fix: the
-// final viewport clamp must PAD short rows to full width (not only truncate
-// long ones) so incremental redraw overwrites the previous frame's stale
-// trailing glyphs without resorting to tea.ClearScreen / flicker (#607).
-func Test_clampViewToViewport_PadsEveryRow(t *testing.T) {
+// Test_clampViewToViewport_TruncatesButNeverPads is the fork inversion of
+// upstream's Test_clampViewToViewport_PadsEveryRow (#1252 / f548343f).
+// Padding short rows to full measured width turns any glyph the terminal
+// draws wider than cellWidth measures it (emoji-class symbols such as the
+// ⚙ ⛁ ⇅ header badges on some emulators) into a wrap at the right margin,
+// shifting the frame and duplicating rows at the top/bottom of the screen
+// (observed on the live deck, 2026-06-10). The fork instead relies on Bubble
+// Tea's EraseLineRight to clear stale trailing glyphs, which is guaranteed
+// because unpadded rows measure narrower than the renderer's terminal width
+// (one-column reserve in the WindowSizeMsg handler). The clamp must still
+// hard-truncate overlong rows and keep the line count exact.
+func Test_clampViewToViewport_TruncatesButNeverPads(t *testing.T) {
 	const width, height = 30, 3
 	in := strings.Join([]string{
-		strings.Repeat("X", width), // already exactly width
-		"short",                    // must be padded out to width
-		"",                         // blank line must also fill the row
+		strings.Repeat("X", width+5), // overlong: must be truncated to width
+		"short",                      // must stay short: padding causes emulator wraps
+		"",                           // blank line must stay empty
 	}, "\n")
 
 	out := clampViewToViewport(in, width, height)
@@ -295,10 +302,14 @@ func Test_clampViewToViewport_PadsEveryRow(t *testing.T) {
 	if len(lines) != height {
 		t.Fatalf("want %d lines, got %d", height, len(lines))
 	}
-	for i, line := range lines {
-		if got := cellWidth(line); got != width {
-			t.Fatalf("line %d cellWidth = %d; want %d (every row must fill the viewport so stale glyphs are overwritten)", i, got, width)
-		}
+	if got := cellWidth(lines[0]); got != width {
+		t.Fatalf("overlong row cellWidth = %d; want %d (must be truncated)", got, width)
+	}
+	if lines[1] != "short" {
+		t.Fatalf("short row = %q; want %q untouched (padding to full width wraps on emulators that draw emoji-class glyphs wide)", lines[1], "short")
+	}
+	if lines[2] != "" {
+		t.Fatalf("blank row = %q; want empty (padding to full width wraps on emulators that draw emoji-class glyphs wide)", lines[2])
 	}
 }
 

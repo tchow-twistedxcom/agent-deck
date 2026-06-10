@@ -11775,13 +11775,20 @@ func clampViewToViewport(content string, width, height int) string {
 		// with a #️⃣ 0️⃣–9️⃣ *️⃣ glyph would otherwise overflow into the
 		// next row here — exactly @jennings's pane-content drift report.
 		//
-		// Also PAD short lines to exactly width (not just truncate long
-		// ones): on incremental redraw a shorter line must overwrite the
-		// full previous row, else the terminal keeps the stale trailing
-		// glyphs — the iTerm2 "ghost line" artifact on session-list scroll
-		// (#607 row-offset drift). fitCellWidth does both, on cellWidth so
-		// this post-join clamp stays a true terminal-cell net.
-		lines[i] = fitCellWidth(line, width)
+		// Fork: truncate-only, deliberately NOT padding short lines to
+		// full width (upstream #1252 / f548343f). Padding turns any glyph
+		// the terminal draws wider than cellWidth measures it (emoji-class
+		// symbols like the ⚙ ⛁ ⇅ header badges on some emulators) into a
+		// hard wrap at the right margin, shifting the whole frame and
+		// duplicating rows at the top/bottom of the screen. Stale trailing
+		// glyphs (the iTerm2 ghost-line artifact #1252 padded against) are
+		// instead cleared by Bubble Tea's EraseLineRight, which is emitted
+		// for every row because unpadded rows measure narrower than the
+		// renderer's terminal width (guaranteed by the one-column reserve
+		// in the WindowSizeMsg handler).
+		if cellWidth(line) > width {
+			lines[i] = cellTruncate(line, width, "")
+		}
 	}
 
 	return strings.Join(lines, "\n")
