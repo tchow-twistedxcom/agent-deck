@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -26,12 +28,16 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/asheshgoplani/agent-deck/internal/agentpaths"
 	"github.com/asheshgoplani/agent-deck/internal/clipboard"
 	"github.com/asheshgoplani/agent-deck/internal/costs"
+	"github.com/asheshgoplani/agent-deck/internal/docker"
 	"github.com/asheshgoplani/agent-deck/internal/feedback"
 	"github.com/asheshgoplani/agent-deck/internal/git"
+	"github.com/asheshgoplani/agent-deck/internal/jujutsu"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/safego"
+	"github.com/asheshgoplani/agent-deck/internal/send"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/sysinfo"
@@ -221,6 +227,7 @@ type Home struct {
 	feedbackState        *feedback.State       // Loaded at first show, avoids repeated disk I/O
 	feedbackSender       *feedback.Sender      // Sender constructed once in NewHome (Phase 3, per D-05)
 	watcherPanel         *WatcherPanel         // For showing watcher status and events
+	toolVisibilityPanel  *ToolVisibilityPanel  // Edits [ui].hidden_tools
 	watcherEngine        *watcher.Engine       // nil until Init (D-07: lifecycle tied to TUI startup)
 
 	// Configurable hotkeys
@@ -413,11 +420,27 @@ type Home struct {
 	activeFilterLabel    string                  // from config.toml [display] active_filter_label
 	activeFilterExcludes map[session.Status]bool // from config.toml [display] active_filter_excludes; default {error}
 
+	// showSessionTimestamps gates the dim "Nm ago" badge on each session row.
+	// Cached here so all rows of a single frame see the same value even if
+	// the user toggles the setting mid-frame. Reloaded after the panel saves.
+	showSessionTimestamps bool
+
+	// showPaneTitles, when true, renders the dim tmux pane-title (task
+	// description) suffix on every session row instead of only the selected
+	// one. Cached here so all rows of a frame agree; reloaded after panel save.
+	showPaneTitles bool
+
 	// Sessions/Preview split (issue #1092): percentage of width allocated to
 	// preview pane. Loaded from config.toml [ui] preview_pct, adjustable
 	// live via < and > keybindings, persisted back to config on adjustment.
 	previewPct          int       // 10-90, default 65
 	previewPctOverlayAt time.Time // when to hide the split overlay (zero = hidden)
+
+	// footerMode selects the bottom hint-bar style (config.toml [ui] footer).
+	// One of session.FooterCurated (default), FooterFull, FooterCompact, or
+	// FooterMinimal. Cached so every render of a frame agrees. Additive/opt-in:
+	// it only changes WHAT the footer advertises, never a keybinding.
+	footerMode string
 
 	// Performance observability (debug mode only, zero cost when off)
 	debugMode          bool         // true when AGENTDECK_DEBUG=1, enables perf overlay
@@ -582,6 +605,22 @@ type selectedItemIdentity struct {
 	windowIndex     int
 }
 
+func (h *Home) saveToolVisibilityConfig() error {
+	if h.toolVisibilityPanel == nil {
+		return nil
+	}
+	cfg, err := session.LoadUserConfig()
+	if err != nil {
+		return err
+	}
+	if cfg == nil {
+		cfg = &session.UserConfig{}
+	}
+	merged := *cfg
+	merged.UI.HiddenTools = h.toolVisibilityPanel.HiddenTools()
+	return session.SaveUserConfig(&merged)
+}
+
 func (h *Home) reloadHotkeysFromConfig() {
 	h.setHotkeys(resolveHotkeys(session.GetHotkeyOverrides()))
 }
@@ -717,6 +756,7 @@ type sessionCreatedMsg struct {
 type sessionForkedMsg struct {
 	instance *session.Instance
 	sourceID string // ID of the source session that was forked (for cleanup)
+	notice   string // non-fatal degradation notice shown after a successful fork
 	err      error
 }
 
@@ -926,6 +966,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		zoxidePicker:         NewZoxidePicker(),
 		feedbackSender:       feedback.NewSender(),
 		watcherPanel:         NewWatcherPanel(),
+		toolVisibilityPanel:  NewToolVisibilityPanel(),
 		insertBatchDuration:  defaultInsertBatchDuration,
 		insertOpenKeySender:  defaultInsertOpenKeySender,
 		cursor:               0,
@@ -982,11 +1023,15 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		h.defaultFilter = cfg.Display.GetDefaultFilter()
 		h.activeFilterLabel = cfg.Display.ActiveFilterLabel
 		h.activeFilterExcludes = cfg.Display.GetActiveFilterExcludes()
+		tmux.SetHideCwdPrefixInTitle(!cfg.Display.GetIncludeCwdPrefix())
+		h.showSessionTimestamps = cfg.Display.ShowSessionTimestamps
+		h.showPaneTitles = cfg.Display.ShowPaneTitles
 		h.sysStatsConfig = cfg.SystemStats
 		h.costLineTemplate, h.costLineHideWhenZero = session.ResolveCostLineTemplate(cfg, actualProfile)
 		h.previewPct = cfg.UI.GetPreviewPct()
 		h.remoteLatencyRefreshSec = cfg.UI.GetRemoteLatencyRefreshSecs(cfg.SystemStats.GetRefreshSeconds())
 		h.remoteSessionRefreshSec = cfg.UI.GetRemoteSessionRefreshSecs()
+		h.footerMode = cfg.UI.GetFooter()
 	} else {
 		h.fullRepaint = (session.DisplaySettings{}).GetFullRepaint()
 		h.activeFilterExcludes = (session.DisplaySettings{}).GetActiveFilterExcludes()
@@ -994,6 +1039,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		h.previewPct = session.DefaultPreviewPct
 		h.remoteLatencyRefreshSec = (session.UISettings{}).GetRemoteLatencyRefreshSecs(0)
 		h.remoteSessionRefreshSec = (session.UISettings{}).GetRemoteSessionRefreshSecs()
+		h.footerMode = (session.UISettings{}).GetFooter()
 	}
 	h.remoteLatency = make(map[string]session.RemoteLatency)
 
@@ -1186,6 +1232,36 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 			}
 			if !prompted {
 				h.pendingHooksPrompt = true
+			}
+		}
+	}
+
+	// Hermes shell hooks: auto-inject silently if the hermes binary is available.
+	// No user prompt needed — config.yaml is Hermes's own config file, not a
+	// shared settings file. The shared hook watcher (h.hookWatcher) covers all
+	// tools, so start it here if Claude hooks didn't already start it.
+	if hermesCmd := strings.TrimSpace(session.GetToolCommand("hermes")); hermesCmd != "" {
+		// GetToolCommand may return a full command string with arguments
+		// (e.g. "hermes --gateway-url=..."). LookPath needs the binary name only.
+		// Trim first because Fields("") and Fields("   ") both return [], and
+		// indexing [0] on an empty slice panics.
+		if hermesFields := strings.Fields(hermesCmd); len(hermesFields) > 0 {
+			hermesBin := hermesFields[0]
+			if _, err := exec.LookPath(hermesBin); err == nil {
+				hermesConfigDir := session.GetHermesConfigDir()
+				if !session.CheckHermesHooksInstalled(hermesConfigDir) {
+					if _, err := session.InjectHermesHooks(hermesConfigDir); err != nil {
+						uiLog.Warn("hermes_hooks_inject_failed", slog.String("error", err.Error()))
+					} else {
+						uiLog.Info("hermes_hooks_installed", slog.String("config_dir", hermesConfigDir))
+					}
+				}
+				if h.hookWatcher == nil {
+					if hookWatcher, err := session.NewStatusFileWatcher(nil); err == nil {
+						h.hookWatcher = hookWatcher
+						go hookWatcher.Start()
+					}
+				}
 			}
 		}
 	}
@@ -1813,10 +1889,14 @@ func (h *Home) syncViewport() {
 	if h.maintenanceMsg != "" {
 		maintenanceBannerHeight = 1
 	}
+	debugBarHeight := 0
+	if h.debugMode {
+		debugBarHeight = 1
+	}
 
 	// contentHeight = total height for main content area
-	// -1 for header line, -helpBarHeight for help bar, -updateBannerHeight, -maintenanceBannerHeight, -filterBarHeight
-	contentHeight := h.height - 1 - helpBarHeight - updateBannerHeight - maintenanceBannerHeight - filterBarHeight
+	// MUST match View(): subtract debugBarHeight when the debug footer is rendered.
+	contentHeight := h.height - 1 - helpBarHeight - updateBannerHeight - maintenanceBannerHeight - filterBarHeight - debugBarHeight
 
 	// CRITICAL: Calculate panelContentHeight based on current layout mode
 	// This MUST match the calculations in renderStackedLayout/renderDualColumnLayout/renderSingleColumnLayout
@@ -1956,8 +2036,12 @@ func (h *Home) getVisibleHeight() int {
 	if h.maintenanceMsg != "" {
 		maintenanceBannerHeight = 1
 	}
+	debugBarHeight := 0
+	if h.debugMode {
+		debugBarHeight = 1
+	}
 
-	contentHeight := h.height - 1 - helpBarHeight - updateBannerHeight - maintenanceBannerHeight - filterBarHeight
+	contentHeight := h.height - 1 - helpBarHeight - updateBannerHeight - maintenanceBannerHeight - filterBarHeight - debugBarHeight
 
 	var panelContentHeight int
 	layoutMode := h.getLayoutMode()
@@ -2479,6 +2563,7 @@ func (h *Home) pruneAnalyticsCache() {
 
 	// Prune MCP info cache (entries older than 10 minutes)
 	session.PruneMCPCache(maxAge)
+	session.PruneCursorMCPCache(maxAge)
 }
 
 // setError sets an error with timestamp for auto-dismiss
@@ -3235,7 +3320,7 @@ func (h *Home) backgroundStatusUpdate() {
 	// Feed hook statuses from watcher to instances (enables hook fast path in UpdateStatus)
 	if h.hookWatcher != nil {
 		for _, inst := range instances {
-			if session.IsClaudeCompatible(inst.Tool) || inst.Tool == "codex" || inst.Tool == "gemini" {
+			if session.IsClaudeCompatible(inst.Tool) || inst.Tool == "codex" || inst.Tool == "gemini" || inst.Tool == "hermes" {
 				if hs := h.hookWatcher.GetHookStatus(inst.ID); hs != nil {
 					inst.UpdateHookStatus(hs)
 				}
@@ -3800,6 +3885,10 @@ func appendClearScreen(cmd tea.Cmd) tea.Cmd {
 	return tea.Batch(cmd, tea.ClearScreen)
 }
 
+// updateInner is the core Bubble Tea update routine for Home. It dispatches a
+// single tea.Msg (key, mouse, tick, or async command result) to the focused
+// component or the appropriate handler and returns the updated model plus any
+// commands to run. Update wraps it to add cross-cutting concerns.
 func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
@@ -3816,6 +3905,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.setupWizard.SetSize(msg.Width, msg.Height)
 		h.settingsPanel.SetSize(msg.Width, msg.Height)
 		h.watcherPanel.SetSize(msg.Width, msg.Height)
+		if h.toolVisibilityPanel != nil {
+			h.toolVisibilityPanel.SetSize(msg.Width, msg.Height)
+		}
 		h.geminiModelDialog.SetSize(msg.Width, msg.Height)
 		return h, nil
 
@@ -3826,6 +3918,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.Button {
 		case tea.MouseButtonWheelUp, tea.MouseButtonWheelDown:
 			if h.setupWizard.IsVisible() {
+				return h, nil
+			}
+			if h.toolVisibilityPanel != nil && h.toolVisibilityPanel.IsVisible() {
 				return h, nil
 			}
 			if h.settingsPanel.IsVisible() {
@@ -4279,6 +4374,13 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Save both instances AND groups
 			// Use forceSave to bypass mtime check - forked session MUST persist
 			h.forceSaveInstances()
+
+			// forceSaveInstances can setError on a failed persist; fold the
+			// non-fatal degradation notice into it rather than overwriting, so a
+			// fork that wasn't actually saved doesn't look successful (#1299 review).
+			if msg.notice != "" {
+				h.setError(noticeError(h.err, msg.notice))
+			}
 
 			// Start fetching preview for the forked session
 			return h, h.fetchPreview(msg.instance, msg.instance.ID, -1)
@@ -5349,11 +5451,37 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return h, cmd
 		}
 
+		if h.toolVisibilityPanel != nil && h.toolVisibilityPanel.IsVisible() {
+			var cmd tea.Cmd
+			var shouldSave bool
+			h.toolVisibilityPanel, cmd, shouldSave = h.toolVisibilityPanel.Update(msg)
+			if shouldSave {
+				if err := h.saveToolVisibilityConfig(); err != nil {
+					h.err = err
+					h.errTime = time.Now()
+				} else {
+					_, _ = session.ReloadUserConfig()
+					if h.newDialog != nil {
+						h.newDialog.RefreshPresetCommands()
+					}
+				}
+				h.settingsPanel.Show()
+				h.settingsPanel.SetSize(h.width, h.height)
+			}
+			return h, cmd
+		}
+
 		// Handle settings panel
 		if h.settingsPanel.IsVisible() {
 			var cmd tea.Cmd
 			var shouldSave bool
 			h.settingsPanel, cmd, shouldSave = h.settingsPanel.Update(msg)
+			if h.settingsPanel.ConsumeToolVisibilityRequest() {
+				h.settingsPanel.Hide()
+				h.toolVisibilityPanel.Show()
+				h.toolVisibilityPanel.SetSize(h.width, h.height)
+				return h, cmd
+			}
 			if shouldSave {
 				// Merge panel output onto the on-disk config so top-level
 				// fields the panel does not manage (Remotes, Hotkeys,
@@ -5369,6 +5497,8 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				_, _ = session.ReloadUserConfig()
 				h.reloadHotkeysFromConfig()
+				h.showSessionTimestamps = config.Display.ShowSessionTimestamps
+				h.showPaneTitles = config.Display.ShowPaneTitles
 
 				// Apply theme changes live
 				h.stopThemeWatcher()
@@ -5705,12 +5835,25 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, cmd
 	}
 
-	switch msg.String() {
-	case "enter":
-		if h.newDialog.shouldHandleEnterLocally() {
+	// Ctrl+S is an explicit "create now" shortcut that submits from any field,
+	// including Name/Branch where Enter advances focus instead of submitting.
+	// Route it through the same path as a submitting Enter by falling through to
+	// the submit block below.
+	submitNow := h.newDialog.WantsSubmit(msg)
+
+	switch {
+	case msg.String() == "enter" || submitNow:
+		if !submitNow && h.newDialog.shouldHandleEnterLocally() {
 			var cmd tea.Cmd
 			h.newDialog, cmd = h.newDialog.Update(msg)
 			return h, cmd
+		}
+
+		// Ctrl+S can fire mid-edit of a multi-repo path. The in-flight text
+		// lives only in pathInput (Enter is the sole committer), so flush it
+		// into multiRepoPaths first; otherwise submit would use stale data.
+		if submitNow {
+			h.newDialog.CommitInFlightMultiRepoEdit()
 		}
 
 		// Validate before creating session
@@ -5725,11 +5868,11 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		claudeOpts := h.newDialog.GetClaudeOptions() // Get Claude options if applicable.
 		launchModelID := h.newDialog.GetLaunchModelID()
 
-		// Resolve worktree target if enabled; actual worktree creation runs in async command.
+		// Resolve worktree/workspace target if enabled; actual creation runs in async command.
 		var worktreePath, worktreeRepoRoot string
 		if worktreeEnabled && branchName != "" {
-			// resolveWorktreeTarget validates the path is a git repo OR a
-			// bare-repo project root (#742 / #715) and implements the #1185
+			// resolveWorktreeTarget validates the path is a supported VCS repo
+			// (git or jujutsu; including bare-repo project roots) and implements the #1185
 			// fallback: a worktree enabled by config default (not an explicit
 			// user toggle) on a non-repo dir falls back to a normal session
 			// instead of erroring, while an explicit worktree still fails loud.
@@ -5761,6 +5904,10 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if codexOpts := h.newDialog.GetCodexOptions(); codexOpts != nil {
 				toolOptionsJSON, _ = session.MarshalToolOptions(codexOpts)
 			}
+		} else if command == "hermes" {
+			yolo := h.newDialog.GetHermesYoloMode()
+			hermesOpts := &session.HermesOptions{YoloMode: &yolo}
+			toolOptionsJSON, _ = session.MarshalToolOptions(hermesOpts)
 		}
 
 		parentSessionID := h.newDialog.GetParentSessionID()
@@ -5831,7 +5978,7 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			tempID,
 		)
 
-	case "esc":
+	case msg.String() == "esc":
 		// #1162: when the model picker dropdown is open, Esc dismisses only the
 		// picker and keeps the new-session form alive (focus stays on the model
 		// field) rather than cancelling the whole flow. Forward to the dialog so
@@ -6016,6 +6163,7 @@ func (h *Home) handleJumpKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (h *Home) hasModalVisible() bool {
 	return h.initialLoading || h.isQuitting || h.notesEditing || h.jumpMode ||
 		h.setupWizard.IsVisible() || h.settingsPanel.IsVisible() ||
+		(h.toolVisibilityPanel != nil && h.toolVisibilityPanel.IsVisible()) ||
 		h.watcherPanel.IsVisible() || // hotkeyWatcherPanel overlay
 		h.helpOverlay.IsVisible() || h.search.IsVisible() || h.globalSearch.IsVisible() ||
 		h.newDialog.IsVisible() || h.groupDialog.IsVisible() || h.forkDialog.IsVisible() ||
@@ -6689,11 +6837,11 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "m":
-		// MCP Manager - for Claude and Gemini sessions
+		// MCP Manager — Claude, Gemini, and Cursor Agent CLI
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession && item.Session != nil &&
-				(session.IsClaudeCompatible(item.Session.Tool) || item.Session.Tool == "gemini") {
+				session.ToolSupportsMCPManager(item.Session.Tool) {
 				h.mcpDialog.SetSize(h.width, h.height)
 				if err := h.mcpDialog.Show(item.Session.ProjectPath, item.Session.ID, item.Session.Tool); err != nil {
 					h.setError(err)
@@ -6721,7 +6869,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "f":
 		// Quick fork session (same title with " (fork)" suffix)
-		// Only available when session has a valid Claude session ID
+		// Only available when the selected tool supports Agent Deck forking
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession && item.Session != nil {
@@ -6739,7 +6887,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "F", "shift+f":
 		// Fork with dialog (customize title and group)
-		// Only available when session has a valid Claude session ID
+		// Only available when the selected tool supports Agent Deck forking
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession && item.Session != nil {
@@ -7066,7 +7214,13 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				h.confirmDialog.ShowDeleteSession(item.Session.ID, item.Session.Title, item.Session.IsSandboxed(), item.Session.IsWorktree())
 			} else if item.Type == session.ItemTypeRemoteSession && item.RemoteSession != nil {
 				h.confirmDialog.ShowDeleteRemoteSession(item.RemoteName, item.RemoteSession.ID, item.RemoteSession.Title)
-			} else if item.Type == session.ItemTypeGroup && item.Path != session.DefaultGroupPath && item.Path != h.groupScope {
+			} else if item.Type == session.ItemTypeGroup && item.Path == session.DefaultGroupPath {
+				// Protected default group: report instead of silently doing nothing.
+				// Checked before the scoped-root case so the message stays specific
+				// even when the TUI is scoped to the default group
+				// (groupScope == DefaultGroupPath), where both conditions would match.
+				h.setError(fmt.Errorf("cannot delete the default %q group", session.DefaultGroupName))
+			} else if item.Type == session.ItemTypeGroup && item.Path != h.groupScope {
 				h.confirmDialog.ShowDeleteGroup(item.Path, item.Group.Name)
 			} else if item.Type == session.ItemTypeGroup && item.Path == h.groupScope {
 				h.setError(fmt.Errorf("cannot delete the scoped root group"))
@@ -7223,6 +7377,25 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 					opts.YoloMode = &newYolo
 					_ = inst.SetCodexOptions(opts)
+					toggled = true
+
+				case "hermes":
+					currentYolo := false
+					opts := inst.GetHermesOptions()
+					if opts != nil && opts.YoloMode != nil {
+						currentYolo = *opts.YoloMode
+					} else {
+						userConfig, _ := session.LoadUserConfig()
+						if userConfig != nil {
+							currentYolo = userConfig.Hermes.YoloMode
+						}
+					}
+					newYolo := !currentYolo
+					if opts == nil {
+						opts = &session.HermesOptions{}
+					}
+					opts.YoloMode = &newYolo
+					_ = inst.SetHermesOptions(opts)
 					toggled = true
 				}
 
@@ -7832,6 +8005,22 @@ func (h *Home) refreshWatcherPanel() {
 	}
 }
 
+// formatWatcherDispatchMsg builds the single line delivered into the conductor
+// pane for a routed watcher event. It prefers the full message Body (so the
+// conductor receives the complete text, not the first-line/200-byte Subject
+// label) and falls back to Subject when Body is empty (e.g. v1 events). Newlines
+// are collapsed to spaces because the delivery uses tmux send-keys, where a
+// literal '\n' is sent as Enter and would submit the line prematurely.
+func formatWatcherDispatchMsg(evt watcher.Event) string {
+	text := strings.TrimSpace(evt.Body)
+	if text == "" {
+		text = evt.Subject
+	}
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\n", " ")
+	return fmt.Sprintf("[%s] %s: %s", evt.Source, evt.Sender, text)
+}
+
 // dispatchWatcherEvent sends a routed watcher event into the conductor's tmux pane.
 // Skipped for triage and unrouted events (RoutedTo empty or "triage") since those have no
 // concrete delivery target yet. Mirrors dispatchHealthAlert: looks up the conductor session
@@ -7840,7 +8029,7 @@ func (h *Home) dispatchWatcherEvent(evt watcher.Event) {
 	if evt.RoutedTo == "" || evt.RoutedTo == "triage" || strings.HasPrefix(evt.RoutedTo, "triage-") {
 		return
 	}
-	msg := fmt.Sprintf("[%s] %s: %s", evt.Source, evt.Sender, evt.Subject)
+	msg := formatWatcherDispatchMsg(evt)
 	sessionTitle := session.ConductorSessionTitle(evt.RoutedTo)
 	h.instancesMu.RLock()
 	instances := h.instances
@@ -7854,9 +8043,8 @@ func (h *Home) dispatchWatcherEvent(evt watcher.Event) {
 			return
 		}
 		tmuxName := ts.Name
-		socket := inst.TmuxSocketName
 		go func() {
-			if err := tmux.Exec(socket, "send-keys", "-t", tmuxName, msg, "Enter").Run(); err != nil {
+			if err := deliverToConductorPane(ts, msg); err != nil {
 				uiLog.Warn("dispatch_watcher_event_send_failed",
 					slog.String("tmux_session", tmuxName),
 					slog.String("error", err.Error()))
@@ -7864,6 +8052,101 @@ func (h *Home) dispatchWatcherEvent(evt watcher.Event) {
 		}()
 		return
 	}
+}
+
+// deliverToConductorPane sends msg into a conductor's tmux pane and verifies it
+// was actually submitted, then returns. A raw single
+// `send-keys <msg> Enter` races the inner agent's input handler: tmux 3.2+ wraps the
+// literal text in bracketed-paste markers (\e[200~…\e[201~) and the trailing
+// Enter lands in the same PTY buffer as the paste-end marker, so async TUIs
+// (Ink/Node.js, curses, ratatui) can swallow it — the message is typed into the composer but never sent. That
+// is exactly how routed messages get silently dropped once this native
+// send-keys path is the sole delivery route (no external bridge).
+//
+// Two layers, agent-agnostic where possible:
+//   - SendKeysAndEnter separates the literal text from a delayed Enter, which
+//     fixes the paste/Enter race for any bracketed-paste TUI.
+//   - A verify loop confirms submission. The tool-agnostic signal is the
+//     session status flipping to "active" (the status detector handles both
+//     claude and codex), proving the agent accepted the input and began work.
+//     For an introspectable composer (claude's prompt marker) it additionally
+//     re-presses Enter while the message is still shown unsent and treats a
+//     cleared composer as submitted; agents without composer introspection get
+//     a small bounded number of fallback Enters in case the delayed Enter was
+//     dropped.
+//
+// Best-effort: returns an error only when no submission signal is seen within
+// the budget, so the caller can log the drop instead of failing silently.
+// Intended to run inside a goroutine.
+func deliverToConductorPane(p conductorPane, msg string) error {
+	return deliverToConductorPaneTuned(p, msg, 40, 250*time.Millisecond)
+}
+
+// conductorPane is the slice of *tmux.Session that reliable delivery needs.
+// Declaring it as an interface keeps the verify-retry loop unit-testable with a
+// fake pane (mirrors the sendRetryTarget interface used by the CLI send path).
+type conductorPane interface {
+	SendKeysAndEnter(string) error
+	SendEnter() error
+	CapturePaneFresh() (string, error)
+	GetStatus() (string, error)
+}
+
+// blindEnterCap bounds the fallback Enter presses for agents whose composer is
+// not introspectable, so a message that was actually delivered (and the agent
+// has since gone idle) is not spammed with empty submissions.
+const blindEnterCap = 3
+
+// deliverToConductorPaneTuned is deliverToConductorPane with the verify budget
+// exposed for tests; production callers use the default budget (~10s).
+func deliverToConductorPaneTuned(p conductorPane, msg string, maxChecks int, checkDelay time.Duration) error {
+	if err := p.SendKeysAndEnter(msg); err != nil {
+		return err
+	}
+	sawUnsent := false
+	blindEnters := 0
+	for i := 0; i < maxChecks; i++ {
+		if checkDelay > 0 {
+			time.Sleep(checkDelay)
+		}
+
+		// Tool-agnostic success: the status detector recognizes claude and codex
+		// "active", so a transition to active proves the Enter was accepted and
+		// the agent began processing the message.
+		if status, err := p.GetStatus(); err == nil && status == "active" {
+			return nil
+		}
+
+		raw, err := p.CapturePaneFresh()
+		if err != nil {
+			continue
+		}
+		content := tmux.StripANSI(raw)
+
+		switch {
+		case send.HasUnsentComposerPrompt(content, msg):
+			// Introspectable composer still holds the message: the trailing
+			// Enter was swallowed, so re-press it. Surface a tmux rejection
+			// immediately rather than letting it masquerade as a timeout.
+			sawUnsent = true
+			if err := p.SendEnter(); err != nil {
+				return fmt.Errorf("retry enter: %w", err)
+			}
+		case sawUnsent || send.HasCurrentComposerPrompt(content):
+			// The composer previously held the message and is now clear, or a
+			// composer is rendered without our message: submitted.
+			return nil
+		case blindEnters < blindEnterCap:
+			// No composer introspection (e.g. codex/cursor) and not yet active.
+			// Re-press Enter a bounded number of times in case the delayed Enter
+			// was dropped, then defer to the status signal above.
+			blindEnters++
+			if err := p.SendEnter(); err != nil {
+				return fmt.Errorf("retry enter: %w", err)
+			}
+		}
+	}
+	return fmt.Errorf("watcher dispatch not confirmed submitted (status never active, composer still pending) after %s", time.Duration(maxChecks)*checkDelay)
 }
 
 // dispatchHealthAlert sends a health alert message to the conductor session associated
@@ -7904,9 +8187,12 @@ func (h *Home) dispatchHealthAlert(state watcher.HealthState) {
 			ts := inst.GetTmuxSession()
 			if ts != nil && ts.Name != "" {
 				tmuxName := ts.Name
-				socket := inst.TmuxSocketName
 				go func() {
-					_ = tmux.Exec(socket, "send-keys", "-t", tmuxName, alertMsg, "Enter").Run()
+					if err := deliverToConductorPane(ts, alertMsg); err != nil {
+						uiLog.Warn("dispatch_health_alert_send_failed",
+							slog.String("tmux_session", tmuxName),
+							slog.String("error", err.Error()))
+					}
 				}()
 			}
 			break
@@ -8236,6 +8522,21 @@ func (h *Home) applyMultiRepoPathChanges(inst *session.Instance, newPaths []stri
 	}
 }
 
+// multiRepoWorktreesRoot resolves the persistent parent directory for
+// multi-repo worktrees and symlink trees. The returned path is recorded in
+// session state (Instance.MultiRepoTempDir, worktree paths), so it MUST be a
+// stable, non-ephemeral location. We therefore propagate any resolution error
+// to the caller rather than falling back to os.TempDir(): worktree/symlink
+// state placed under temp storage would be silently removed by a reboot or
+// tmp cleanup, breaking the affected sessions (Codex round-2 P1).
+func multiRepoWorktreesRoot() (string, error) {
+	dir, err := agentpaths.EffectiveDataPath("multi-repo-worktrees", "multi-repo-worktrees")
+	if err != nil {
+		return "", fmt.Errorf("resolve multi-repo worktrees root: %w", err)
+	}
+	return dir, nil
+}
+
 // handleSkillDialogKey handles keys when Skills dialog is visible
 func (h *Home) handleSkillDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
@@ -8363,10 +8664,14 @@ func (h *Home) handleGroupDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 				} else {
 					// Local session rename
-					// Find and rename the session (O(1) lookup)
+					// Find and rename the session (O(1) lookup). Route through
+					// SetField so the rename also sets TitleLocked — a direct
+					// Title assignment would be reverted by the #572
+					// Claude-name sync on the next hook event.
 					if inst := h.getInstanceByID(sessionID); inst != nil {
-						inst.Title = newName
-						inst.SyncTmuxDisplayName()
+						if _, _, err := session.SetField(inst, session.FieldTitle, newName, nil); err != nil {
+							h.setError(err)
+						}
 					}
 					// Store pending title change so it survives reload races.
 					// If saveInstances() is skipped (isReloading=true), the reload
@@ -8381,10 +8686,12 @@ func (h *Home) handleGroupDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 		h.groupDialog.Hide()
+		h.lastGTime = time.Time{} // Reset gg-detection so next 'g' opens dialog, not jump-to-top
 		return h, nil
 	case "esc":
 		h.groupDialog.Hide()
-		h.clearError() // Clear any validation error
+		h.clearError()            // Clear any validation error
+		h.lastGTime = time.Time{} // Reset gg-detection so next 'g' opens dialog, not jump-to-top
 		return h, nil
 	}
 
@@ -8425,27 +8732,31 @@ func (h *Home) handleForkDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				// new-session path (#742). #1185: a worktree enabled by config
 				// default (not an explicit toggle) on a non-repo dir falls back
 				// to a normal fork instead of erroring.
-				if worktreeEnabled && branchName != "" {
-					worktreePath, repoRoot, fallback, errMsg := resolveWorktreeTarget(source.ProjectPath, branchName, h.forkDialog.IsWorktreeExplicit())
-					if errMsg != "" {
-						h.forkDialog.SetError(errMsg)
-						return h, nil
-					}
-					if !fallback {
-						if opts == nil {
-							opts = &session.ClaudeOptions{}
-						}
-						opts.WorkDir = worktreePath
-						opts.WorktreePath = worktreePath
-						opts.WorktreeRepoRoot = repoRoot
-						opts.WorktreeBranch = branchName
-					}
-				}
-
 				parentID := h.forkDialog.GetParentSessionID()
 				parentPath := h.forkDialog.GetParentProjectPath()
+				result := h.buildForkCmd(
+					source, title, groupPath, branchName,
+					forkToggles{
+						Worktree:         worktreeEnabled,
+						WithState:        h.forkDialog.IsWithStateEnabled(),
+						WithIgnored:      h.forkDialog.IsWithStateAndGitignoredEnabled(),
+						Sandbox:          h.forkDialog.IsSandboxEnabled(),
+						ExplicitWorktree: h.forkDialog.IsWorktreeExplicit(),
+						// Dialog title is explicit user intent: lock against #572 name sync.
+						LockTitle: true,
+					},
+					opts,
+					parentID, parentPath,
+				)
+				if result.errMsg != "" {
+					h.forkDialog.SetError(result.errMsg)
+					return h, nil
+				}
+				if result.cmd == nil {
+					return h, nil
+				}
 				h.forkDialog.Hide()
-				return h, h.forkSessionCmdWithOptions(source, title, groupPath, opts, h.forkDialog.IsSandboxEnabled(), parentID, parentPath)
+				return h, result.cmd
 			}
 		}
 		h.forkDialog.Hide()
@@ -8790,11 +9101,14 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 
 			if worktreeBranch != "" {
 				// Multi-repo + worktree: create a persistent parent dir with all worktrees inside.
-				// Layout: ~/.agent-deck/multi-repo-worktrees/<branch>-<id>/<repo-name>/
-				home, _ := os.UserHomeDir()
+				// Layout: <effective-data-dir>/multi-repo-worktrees/<branch>-<id>/<repo-name>/
 				sanitizedBranch := strings.ReplaceAll(worktreeBranch, "/", "-")
 				sanitizedBranch = strings.ReplaceAll(sanitizedBranch, " ", "-")
-				parentDir := filepath.Join(home, ".agent-deck", "multi-repo-worktrees",
+				worktreesRoot, rootErr := multiRepoWorktreesRoot()
+				if rootErr != nil {
+					return sessionCreatedMsg{err: fmt.Errorf("failed to resolve multi-repo worktree dir: %w", rootErr), tempID: tempID}
+				}
+				parentDir := filepath.Join(worktreesRoot,
 					fmt.Sprintf("%s-%s", sanitizedBranch, inst.ID[:8]))
 				if mkErr := os.MkdirAll(parentDir, 0o755); mkErr != nil {
 					return sessionCreatedMsg{err: fmt.Errorf("failed to create multi-repo worktree dir: %w", mkErr), tempID: tempID}
@@ -8813,8 +9127,11 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 				inst.AdditionalPaths = wtResult.MappedPaths[1:]
 			} else {
 				// Multi-repo without worktree: create a persistent parent dir with symlinks.
-				home, _ := os.UserHomeDir()
-				parentDir := filepath.Join(home, ".agent-deck", "multi-repo-worktrees", inst.ID[:8])
+				worktreesRoot, rootErr := multiRepoWorktreesRoot()
+				if rootErr != nil {
+					return sessionCreatedMsg{err: fmt.Errorf("failed to resolve multi-repo dir: %w", rootErr), tempID: tempID}
+				}
+				parentDir := filepath.Join(worktreesRoot, inst.ID[:8])
 				if mkErr := os.MkdirAll(parentDir, 0o755); mkErr != nil {
 					return sessionCreatedMsg{err: fmt.Errorf("failed to create multi-repo dir: %w", mkErr), tempID: tempID}
 				}
@@ -8944,14 +9261,145 @@ func applyCreateSessionToolOverrides(inst *session.Instance, tool string, gemini
 	}
 }
 
-// quickForkSession performs a quick fork with default title suffix " (fork)"
+// quickForkSpec is the resolved input set for a comprehensive quick fork.
+type quickForkSpec struct {
+	Title     string
+	GroupPath string
+	Branch    string
+	Plan      session.ResolvedForkPlan
+}
+
+// quickForkInputs computes the comprehensive quick-fork spec from the source
+// session and [fork] config. Pure: no side effects, no UI, no I/O — the wiring
+// (Claude-opts inheritance, degradation notices, dispatch) lives in
+// quickForkSession. parentSandboxed is source.IsSandboxed().
+func quickForkInputs(source *session.Instance, fork session.ForkSettings, parentSandboxed bool) quickForkSpec {
+	slug := git.SanitizeBranchName(strings.ToLower(strings.TrimSpace(source.Title)))
+	if slug == "" {
+		slug = "fork"
+	}
+	return quickForkSpec{
+		Title:     source.Title + " (fork)",
+		GroupPath: source.GroupPath,
+		Branch:    fork.GetBranchPrefix() + slug,
+		Plan:      fork.Resolve(parentSandboxed),
+	}
+}
+
+// uniqueForkBranch returns base, or base-2 / base-3 / … — the first name with no
+// existing git branch and no linked worktree — so repeated quick forks of the same
+// source session don't collide on the deterministic branch name (comprehensive
+// fork forces a fresh worktree+branch). Non-git sources have no branch to collide
+// with, so base is returned unchanged.
+func uniqueForkBranch(projectPath, base string) string {
+	backend, err := vcsbackend.Detect(projectPath)
+	if err != nil {
+		return base
+	}
+	candidate := base
+	for n := 2; forkBranchTaken(backend, candidate); n++ {
+		candidate = fmt.Sprintf("%s-%d", base, n)
+		if n > 1000 {
+			return candidate // pathological guard; never expected in practice
+		}
+	}
+	return candidate
+}
+
+// forkBranchTaken reports whether a branch/bookmark name is already used by the
+// detected VCS backend or already has a linked worktree/workspace.
+func forkBranchTaken(backend vcs.Backend, branch string) bool {
+	if backend.BranchExists(branch) {
+		return true
+	}
+	wt, err := backend.GetWorktreeForBranch(branch)
+	return err == nil && wt != ""
+}
+
+// resolveQuickForkSpec computes the comprehensive quick-fork spec and applies the
+// backend with-state gate — i.e. the exact spec quickForkSession forks from
+// (modulo the downstream unique-branch bump). Kept as a seam so the `f`-path
+// with-state decision is testable against real repos without the tmux/tea.Cmd
+// machinery.
+func resolveQuickForkSpec(source *session.Instance, fork session.ForkSettings) quickForkSpec {
+	in := quickForkInputs(source, fork, source.IsSandboxed())
+	return gateForkStateForBackend(in, source.ProjectPath)
+}
+
+// gateForkStateForBackend disables with-state materialization when the source
+// repo's VCS backend cannot carry working state. The comprehensive quick-fork
+// default forces WithState=true; git and jujutsu both support with-state (git
+// via forkWithStateWorktree, jj via forkWithStateWorkspaceJJ since #1305), so
+// only a truly unsupported or undetectable backend degrades to a plain
+// (workspace) fork. The worktree/workspace itself is still created either way.
+func gateForkStateForBackend(in quickForkSpec, projectPath string) quickForkSpec {
+	if !in.Plan.WithState {
+		return in
+	}
+	backend, err := vcsbackend.Detect(projectPath)
+	if err != nil || !backendSupportsWithState(backend.Type()) {
+		in.Plan.WithState = false
+		in.Plan.WithIgnored = false
+	}
+	return in
+}
+
+// backendSupportsWithState reports whether a VCS backend can materialize a
+// parent's working state into a fork. git and jujutsu qualify; everything else
+// degrades to a plain workspace fork.
+func backendSupportsWithState(t vcs.Type) bool {
+	return t == vcs.TypeGit || t == vcs.TypeJujutsu
+}
+
+// quickForkSession performs a comprehensive quick fork: new worktree+branch,
+// carry tracked+gitignored state, match parent Docker, inherit the parent's
+// Claude launch options for Claude-compatible sessions, and keep sibling
+// placement. Defaults come from [fork] config (comprehensive when unset).
+// Non-fatal degradation notices are reported after the async fork succeeds.
 func (h *Home) quickForkSession(source *session.Instance) tea.Cmd {
 	if source == nil {
 		return nil
 	}
-	title := source.Title + " (fork)"
-	groupPath := source.GroupPath
-	return h.forkSessionCmd(source, title, groupPath, source.ParentSessionID, source.ParentProjectPath)
+	cfg, _ := session.LoadUserConfig()
+	fork := session.ForkSettings{}
+	if cfg != nil {
+		fork = cfg.Fork
+	}
+	in := resolveQuickForkSpec(source, fork)
+
+	// Repeated quick forks of the same source would otherwise collide on the
+	// deterministic branch name (comprehensive fork forces a fresh worktree+branch),
+	// so the second `f` would fail. Bump to fork/<slug>-2, -3, … so you can fan out
+	// multiple alternative forks from one session.
+	if in.Plan.Worktree {
+		in.Branch = uniqueForkBranch(source.ProjectPath, in.Branch)
+	}
+
+	// Inherit the parent's persisted Claude launch options (transient worktree
+	// fields are json:"-" so they are never carried over). nil falls back to
+	// global config downstream, as before.
+	opts := source.GetClaudeOptions()
+
+	result := h.buildForkCmd(
+		source, in.Title, in.GroupPath, in.Branch,
+		forkToggles{
+			Worktree:    in.Plan.Worktree,
+			WithState:   in.Plan.WithState,
+			WithIgnored: in.Plan.WithIgnored,
+			Sandbox:     in.Plan.Sandbox,
+			// ExplicitWorktree stays false: quick fork worktree is
+			// config-default, not an explicit toggle (#1185). LockTitle stays
+			// false: the auto-generated "<title> (fork)" name is not user
+			// intent, so the #572 name sync stays enabled.
+		},
+		opts,
+		source.ParentSessionID, source.ParentProjectPath,
+	)
+	if result.errMsg != "" {
+		h.setError(fmt.Errorf("%s", result.errMsg))
+		return nil
+	}
+	return result.cmd
 }
 
 // quickCreateSession creates a session instantly with auto-generated name and smart defaults.
@@ -9044,7 +9492,7 @@ func (h *Home) quickCreateSession() tea.Cmd {
 	if tool == "" {
 		tool = "claude"
 	}
-	if command == "" {
+	if command == "" && tool != "shell" {
 		if tool == "cursor" {
 			command = "cursor agent"
 		} else {
@@ -9129,6 +9577,9 @@ func (h *Home) quickCreateSessionAt(projectPath string) tea.Cmd {
 		tool = "claude"
 	}
 	command := tool
+	if tool == "shell" {
+		command = ""
+	}
 
 	preferred := deriveSessionNameFromPath(projectPath)
 	h.instancesMu.RLock()
@@ -9222,27 +9673,283 @@ func (h *Home) forkSessionWithDialog(source *session.Instance) tea.Cmd {
 	// Pre-populate dialog with source session info
 	conductors := h.activeConductorSessions()
 	suggestedParentID := h.suggestConductorParent()
-	h.forkDialog.Show(source.Title, source.ProjectPath, source.GroupPath, conductors, suggestedParentID)
+	h.forkDialog.ShowWithParentSandboxed(source.Title, source.ProjectPath, source.GroupPath, conductors, suggestedParentID, source.IsSandboxed())
 	return nil
 }
 
-// forkSessionCmd creates a forked session with the given title and group
-// Shows immediate UI feedback by tracking the source session in forkingSessions
-func (h *Home) forkSessionCmd(source *session.Instance, title, groupPath, parentSessionID, parentProjectPath string) tea.Cmd {
-	return h.forkSessionCmdWithOptions(source, title, groupPath, nil, false, parentSessionID, parentProjectPath)
+type forkWithStateWorktreeDeps struct {
+	statPath                  func(string) (os.FileInfo, error)
+	mkdirAll                  func(string, os.FileMode) error
+	validateDestination       func(string, string) error
+	detectInProgressOperation func(string) (string, error)
+	hasSubmodules             func(string) bool
+	headCommit                func(string) (string, error)
+	createAtStartPoint        func(string, string, string, string) (bool, error)
+	materialize               func(string, string, bool) error
+	processInclude            func(string, string, io.Writer) error
+	runSetup                  func(string, string, io.Writer, io.Writer, time.Duration) error
+	removeWorktree            func(string, string, bool) error
+	deleteBranch              func(string, string, bool) error
 }
 
-// forkSessionCmdWithOptions creates a forked session with the given title, group, Claude options, and optional sandbox.
+func defaultForkWithStateWorktreeDeps() forkWithStateWorktreeDeps {
+	return forkWithStateWorktreeDeps{
+		statPath:                  os.Stat,
+		mkdirAll:                  os.MkdirAll,
+		validateDestination:       git.ValidateForkWithStateDestination,
+		detectInProgressOperation: git.DetectInProgressOperation,
+		hasSubmodules:             git.HasSubmodules,
+		headCommit:                git.HeadCommit,
+		createAtStartPoint:        git.CreateWorktreeAtStartPoint,
+		materialize:               git.MaterializeWipFromParent,
+		processInclude:            git.ProcessWorktreeInclude,
+		runSetup:                  git.RunWorktreeSetupAfterCreate,
+		removeWorktree:            git.RemoveWorktree,
+		deleteBranch:              git.DeleteBranch,
+	}
+}
+
+// forkInstanceDeps injects the post-helper instance-create/start/multi-repo and
+// rollback steps of forkSessionCmdWithOptions so the three rollback paths are
+// behaviorally testable (review finding G1).
+type forkInstanceDeps struct {
+	createInstance     func(source *session.Instance, title, groupPath string, opts *session.ClaudeOptions) (*session.Instance, error)
+	createMultiRepoDir func(inst, source *session.Instance) error
+	startInstance      func(inst *session.Instance) error
+	rollback           func(repoRoot, worktreePath, branch string)
+}
+
+func defaultForkInstanceDeps() forkInstanceDeps {
+	return forkInstanceDeps{
+		createInstance: func(source *session.Instance, title, groupPath string, opts *session.ClaudeOptions) (*session.Instance, error) {
+			inst, _, err := source.CreateForkedInstanceForTool(title, groupPath, opts)
+			return inst, err
+		},
+		createMultiRepoDir: func(inst, source *session.Instance) error {
+			// Propagate multi-repo config from source.
+			if source.IsMultiRepo() {
+				inst.MultiRepoEnabled = true
+				inst.AdditionalPaths = append([]string{}, source.AdditionalPaths...)
+				// Copy worktree tracking from source (shared worktrees)
+				if len(source.MultiRepoWorktrees) > 0 {
+					inst.MultiRepoWorktrees = append([]session.MultiRepoWorktree{}, source.MultiRepoWorktrees...)
+				}
+				// Create a new persistent dir for the fork with symlinks to shared worktrees
+				worktreesRoot, rootErr := multiRepoWorktreesRoot()
+				if rootErr != nil {
+					return fmt.Errorf("failed to resolve multi-repo dir: %w", rootErr)
+				}
+				parentDir := filepath.Join(worktreesRoot, inst.ID[:8])
+				if mkErr := os.MkdirAll(parentDir, 0o755); mkErr != nil {
+					return fmt.Errorf("failed to create multi-repo dir: %w", mkErr)
+				}
+				if resolved, evalErr := filepath.EvalSymlinks(parentDir); evalErr == nil {
+					parentDir = resolved
+				}
+				inst.MultiRepoTempDir = parentDir
+				if inst.GetTmuxSession() != nil {
+					inst.GetTmuxSession().WorkDir = parentDir
+				}
+				// Recreate symlinks/entries in new parent dir pointing to source worktree paths
+				allPaths := inst.AllProjectPaths()
+				dirnames := session.DeduplicateDirnames(allPaths)
+				var newProjectPath string
+				var newAdditionalPaths []string
+				for i, p := range allPaths {
+					linkPath := filepath.Join(parentDir, dirnames[i])
+					_ = os.Symlink(p, linkPath)
+					if i == 0 {
+						newProjectPath = linkPath
+					} else {
+						newAdditionalPaths = append(newAdditionalPaths, linkPath)
+					}
+				}
+				inst.ProjectPath = newProjectPath
+				inst.AdditionalPaths = newAdditionalPaths
+			}
+			return nil
+		},
+		startInstance: func(inst *session.Instance) error { return inst.Start() },
+		rollback: func(repoRoot, worktreePath, branch string) {
+			_ = rollbackForkWithStateWorktree(repoRoot, worktreePath, branch)
+		},
+	}
+}
+
+// completeFork performs the post-forkWithStateWorktree sequence: create the
+// forked instance, apply sandbox/multi-repo/parent config, and start it. On any
+// failure after a with-state worktree was created (withStateWorktreeCreated),
+// it rolls back the new worktree+branch. Free function: it needs nothing from
+// *Home.
+//
+// toggles.LockTitle marks the new instance TitleLocked: a forked Claude
+// session inherits the parent's session name (e.g. an auto-assigned plan
+// title), so without the lock the #572 name sync clobbers the title the user
+// typed in the fork dialog on the fork's first hook event. Quick fork leaves
+// it false — its "<title> (fork)" name is auto-generated, not user intent.
+func completeFork(
+	source *session.Instance,
+	title, groupPath string,
+	toggles forkToggles,
+	opts *session.ClaudeOptions,
+	parentSessionID, parentProjectPath string,
+	withStateWorktreeCreated bool,
+	deps forkInstanceDeps,
+) (*session.Instance, error) {
+	inst, err := deps.createInstance(source, title, groupPath, opts)
+	if err != nil {
+		if withStateWorktreeCreated {
+			deps.rollback(opts.WorktreeRepoRoot, opts.WorktreePath, opts.WorktreeBranch)
+		}
+		return nil, fmt.Errorf("cannot create forked instance: %w", err)
+	}
+	if toggles.LockTitle {
+		inst.TitleLocked = true
+	}
+
+	// Apply sandbox config to forked instance.
+	if toggles.Sandbox {
+		inst.Sandbox = session.NewSandboxConfig("")
+	}
+
+	if err := deps.createMultiRepoDir(inst, source); err != nil {
+		if withStateWorktreeCreated {
+			deps.rollback(opts.WorktreeRepoRoot, opts.WorktreePath, opts.WorktreeBranch)
+		}
+		return nil, err
+	}
+
+	if parentSessionID != "" {
+		inst.SetParentWithPath(parentSessionID, parentProjectPath)
+	}
+
+	if err := deps.startInstance(inst); err != nil {
+		if withStateWorktreeCreated {
+			deps.rollback(opts.WorktreeRepoRoot, opts.WorktreePath, opts.WorktreeBranch)
+		}
+		return nil, err
+	}
+
+	switch inst.Tool {
+	case "opencode":
+		go inst.DetectOpenCodeSession()
+	}
+
+	return inst, nil
+}
+
+type forkBuildResult struct {
+	cmd             tea.Cmd
+	worktreeApplied bool
+	notice          string
+	errMsg          string
+}
+
+// forkToggles groups the fork pipeline's boolean knobs so call sites stay
+// self-documenting instead of a positional true/false list.
+type forkToggles struct {
+	// Worktree creates the fork in a new worktree on a new branch.
+	Worktree bool
+	// WithState materializes the parent's working-tree state into the worktree.
+	WithState bool
+	// WithIgnored also copies gitignored files (implies WithState).
+	WithIgnored bool
+	// Sandbox runs the forked session in a Docker sandbox.
+	Sandbox bool
+	// ExplicitWorktree marks Worktree as an explicit user toggle rather than a
+	// config default, gating the #1185 non-repo fallback.
+	ExplicitWorktree bool
+	// LockTitle sets TitleLocked on the fork: the title is explicit user
+	// intent (fork dialog), so the #572 Claude-name sync must not clobber it.
+	LockTitle bool
+}
+
+// buildForkCmd resolves the worktree target (when requested + git-capable),
+// populates the worktree fields on opts, builds WorktreeStateOptions, and
+// returns the async fork command plus any non-fatal success notice. Shared by
+// the dialog (Shift+F) and quick fork (f). Fatal validation text is returned to
+// the caller so Shift+F can keep using ForkDialog.SetError while quick fork uses
+// Home.setError. explicitWorktree is forwarded to resolveWorktreeTarget's #1185
+// fallback gate.
+func (h *Home) buildForkCmd(
+	source *session.Instance,
+	title, groupPath, branchName string,
+	toggles forkToggles,
+	opts *session.ClaudeOptions,
+	parentSessionID, parentProjectPath string,
+) forkBuildResult {
+	worktreeApplied := false
+	notice := ""
+	if toggles.Worktree && branchName != "" {
+		worktreePath, repoRoot, fallback, errMsg := resolveWorktreeTarget(source.ProjectPath, branchName, toggles.ExplicitWorktree)
+		if errMsg != "" {
+			return forkBuildResult{errMsg: errMsg}
+		}
+		if !fallback {
+			if opts == nil {
+				opts = &session.ClaudeOptions{}
+			}
+			opts.WorkDir = worktreePath
+			opts.WorktreePath = worktreePath
+			opts.WorktreeRepoRoot = repoRoot
+			opts.WorktreeBranch = branchName
+			worktreeApplied = true
+		} else {
+			notice = "forked without worktree: not a git or jujutsu repo"
+		}
+	}
+	forkState := git.WorktreeStateOptions{WithState: toggles.WithState, WithIgnored: toggles.WithIgnored}
+	if !worktreeApplied {
+		// State materialization requires a freshly created worktree.
+		forkState = git.WorktreeStateOptions{}
+	}
+	return forkBuildResult{
+		cmd:             h.forkSessionCmdWithOptions(source, title, groupPath, toggles, opts, forkState, parentSessionID, parentProjectPath, notice),
+		worktreeApplied: worktreeApplied,
+		notice:          notice,
+	}
+}
+
+func joinForkNotices(a, b string) string {
+	if a == "" {
+		return b
+	}
+	if b == "" {
+		return a
+	}
+	return a + "; " + b
+}
+
+// noticeError folds a non-fatal fork degradation notice into any pre-existing
+// error (e.g. one set by a failed forceSaveInstances) so the notice never
+// silently masks a real failure. Returns existing unchanged when notice is empty.
+func noticeError(existing error, notice string) error {
+	if notice == "" {
+		return existing
+	}
+	if existing == nil {
+		return fmt.Errorf("%s", notice)
+	}
+	return fmt.Errorf("%v; %s", existing, notice)
+}
+
+// forkSessionCmdWithOptions creates a forked session with the given title, group, shared fork options, and optional sandbox.
 // Shows immediate UI feedback by tracking the source session in forkingSessions.
 func (h *Home) forkSessionCmdWithOptions(
 	source *session.Instance,
 	title, groupPath string,
+	toggles forkToggles,
 	opts *session.ClaudeOptions,
-	sandboxEnabled bool,
+	forkState git.WorktreeStateOptions,
 	parentSessionID, parentProjectPath string,
+	notice string,
 ) tea.Cmd {
 	if source == nil {
 		return nil
+	}
+
+	if forkState.WithIgnored {
+		forkState.WithState = true
 	}
 
 	// Track source session as "forking" for immediate UI feedback
@@ -9256,6 +9963,20 @@ func (h *Home) forkSessionCmdWithOptions(
 			return sessionForkedMsg{err: fmt.Errorf("cannot fork session: %w", err), sourceID: sourceID}
 		}
 
+		// toggles is a value copy, so degrading Sandbox here is local to this fork.
+		forkNotice := notice
+		if toggles.Sandbox {
+			if err := docker.CheckAvailability(context.Background()); err != nil {
+				toggles.Sandbox = false
+				forkNotice = joinForkNotices(forkNotice, "forked without Docker: not available")
+			}
+		}
+
+		// withStateWorktreeCreated tracks whether forkWithStateWorktree actually
+		// created a new worktree+branch, so later failures can roll it back
+		// without dereferencing opts when no worktree was created (e.g. the
+		// #1185 config-default fallback leaves the worktree fields empty).
+		withStateWorktreeCreated := false
 		if opts != nil && opts.WorktreePath != "" && opts.WorktreeRepoRoot != "" && opts.WorktreeBranch != "" {
 			// Worktree creation can be slow on large repos; keep it in async cmd path
 			// so the TUI remains responsive.
@@ -9266,8 +9987,44 @@ func (h *Home) forkSessionCmdWithOptions(
 				return sessionForkedMsg{err: fmt.Errorf("failed to detect VCS: %w", err), sourceID: sourceID}
 			}
 
-			// Check for an existing worktree for this branch before creating a new one.
-			if existingPath, err := backend.GetWorktreeForBranch(opts.WorktreeBranch); err == nil && existingPath != "" {
+			// With-state forks are routed by backend and never reuse an existing
+			// worktree/workspace; otherwise check for an existing worktree for this
+			// branch before creating a new one.
+			if forkState.WithState {
+				switch backend.Type() {
+				case vcs.TypeGit:
+					if err := forkWithStateWorktree(
+						source.ProjectPath,
+						opts.WorktreeRepoRoot,
+						opts.WorktreePath,
+						opts.WorktreeBranch,
+						forkState,
+						defaultForkWithStateWorktreeDeps(),
+					); err != nil {
+						return sessionForkedMsg{err: err, sourceID: sourceID}
+					}
+				case vcs.TypeJujutsu:
+					if err := forkWithStateWorkspaceJJ(
+						source.ProjectPath,
+						opts.WorktreeRepoRoot,
+						opts.WorktreePath,
+						opts.WorktreeBranch,
+						forkState,
+					); err != nil {
+						return sessionForkedMsg{err: err, sourceID: sourceID}
+					}
+					// gitignored files are copied via git's exclude machinery; a jj
+					// repo with no git worktree root (pure jj, or a linked workspace)
+					// can't enumerate them, so tell the user instead of dropping them
+					// silently.
+					if forkState.WithIgnored && !jujutsu.SupportsGitignoredCopy(source.ProjectPath) {
+						forkNotice = joinForkNotices(forkNotice, "forked without gitignored files: this jj repo has no git metadata to copy them")
+					}
+				default:
+					return sessionForkedMsg{err: fmt.Errorf("--with-state is not supported for this repository's VCS backend"), sourceID: sourceID}
+				}
+				withStateWorktreeCreated = true
+			} else if existingPath, err := backend.GetWorktreeForBranch(opts.WorktreeBranch); err == nil && existingPath != "" {
 				uiLog.Info("worktree_reuse", slog.String("branch", opts.WorktreeBranch), slog.String("path", existingPath))
 				opts.WorktreePath = existingPath
 			} else {
@@ -9280,78 +10037,199 @@ func (h *Home) forkSessionCmdWithOptions(
 			}
 		}
 
-		var inst *session.Instance
-		var err error
-
-		switch source.Tool {
-		case "opencode":
-			inst, _, err = source.CreateForkedOpenCodeInstance(title, groupPath)
-		default:
-			inst, _, err = source.CreateForkedInstanceWithOptions(title, groupPath, opts)
-		}
+		inst, err := completeFork(source, title, groupPath, toggles, opts, parentSessionID, parentProjectPath, withStateWorktreeCreated, defaultForkInstanceDeps())
 		if err != nil {
-			return sessionForkedMsg{err: fmt.Errorf("cannot create forked instance: %w", err), sourceID: sourceID}
-		}
-
-		// Apply sandbox config to forked instance.
-		if sandboxEnabled {
-			inst.Sandbox = session.NewSandboxConfig("")
-		}
-
-		// Propagate multi-repo config from source.
-		if source.IsMultiRepo() {
-			inst.MultiRepoEnabled = true
-			inst.AdditionalPaths = append([]string{}, source.AdditionalPaths...)
-			// Copy worktree tracking from source (shared worktrees)
-			if len(source.MultiRepoWorktrees) > 0 {
-				inst.MultiRepoWorktrees = append([]session.MultiRepoWorktree{}, source.MultiRepoWorktrees...)
-			}
-			// Create a new persistent dir for the fork with symlinks to shared worktrees
-			home, _ := os.UserHomeDir()
-			parentDir := filepath.Join(home, ".agent-deck", "multi-repo-worktrees", inst.ID[:8])
-			if mkErr := os.MkdirAll(parentDir, 0o755); mkErr != nil {
-				return sessionForkedMsg{err: fmt.Errorf("failed to create multi-repo dir: %w", mkErr), sourceID: sourceID}
-			}
-			if resolved, evalErr := filepath.EvalSymlinks(parentDir); evalErr == nil {
-				parentDir = resolved
-			}
-			inst.MultiRepoTempDir = parentDir
-			if inst.GetTmuxSession() != nil {
-				inst.GetTmuxSession().WorkDir = parentDir
-			}
-			// Recreate symlinks/entries in new parent dir pointing to source worktree paths
-			allPaths := inst.AllProjectPaths()
-			dirnames := session.DeduplicateDirnames(allPaths)
-			var newProjectPath string
-			var newAdditionalPaths []string
-			for i, p := range allPaths {
-				linkPath := filepath.Join(parentDir, dirnames[i])
-				_ = os.Symlink(p, linkPath)
-				if i == 0 {
-					newProjectPath = linkPath
-				} else {
-					newAdditionalPaths = append(newAdditionalPaths, linkPath)
-				}
-			}
-			inst.ProjectPath = newProjectPath
-			inst.AdditionalPaths = newAdditionalPaths
-		}
-
-		if parentSessionID != "" {
-			inst.SetParentWithPath(parentSessionID, parentProjectPath)
-		}
-
-		if err := inst.Start(); err != nil {
 			return sessionForkedMsg{err: err, sourceID: sourceID}
 		}
 
-		switch inst.Tool {
-		case "opencode":
-			go inst.DetectOpenCodeSession()
-		}
-
-		return sessionForkedMsg{instance: inst, sourceID: sourceID}
+		return sessionForkedMsg{instance: inst, sourceID: sourceID, notice: forkNotice}
 	}
+}
+
+// rollbackForkWithStateWorktree removes the worktree/workspace and deletes the
+// branch created by the with-state fork helpers, used when a later step fails
+// after the helper already succeeded. Failures are both logged and returned
+// (joined): the completeFork post-create path discards the return as best-effort
+// so the caller's original error is preserved, while forkWithStateWorkspaceJJ
+// uses it to report an accurate "cleaned up" vs "cleanup also failed" message
+// instead of claiming success over an orphaned workspace.
+//
+// It re-detects the VCS backend so jj forks roll back via `jj workspace forget`
+// (and bookmark delete) rather than git's worktree/branch removal — using the
+// wrong VCS here would leave the new workspace orphaned. On detection failure it
+// falls back to git semantics (the pre-#1305 behavior).
+func rollbackForkWithStateWorktree(repoRoot, worktreePath, branch string) error {
+	var errs []string
+	removeWorktree := func(rmErr error) {
+		if rmErr != nil {
+			uiLog.Warn("fork_with_state_rollback_worktree_failed", slog.String("path", worktreePath), slog.String("err", rmErr.Error()))
+			errs = append(errs, fmt.Sprintf("worktree remove failed: %v", rmErr))
+		}
+	}
+	deleteBranch := func(brErr error) {
+		if brErr != nil {
+			uiLog.Warn("fork_with_state_rollback_branch_failed", slog.String("branch", branch), slog.String("err", brErr.Error()))
+			errs = append(errs, fmt.Sprintf("branch delete failed: %v", brErr))
+		}
+	}
+	if backend, err := vcsbackend.Detect(repoRoot); err != nil {
+		removeWorktree(git.RemoveWorktree(repoRoot, worktreePath, true))
+		deleteBranch(git.DeleteBranch(repoRoot, branch, true))
+	} else {
+		removeWorktree(backend.RemoveWorktree(worktreePath, true))
+		deleteBranch(backend.DeleteBranch(branch, true))
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("%s", strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// forkWithStateWorktree creates the fork's worktree, anchors it to the parent
+// session's HEAD, and materializes the parent's working-tree state, mirroring
+// the CLI safeguards from #1263. Defined after forkSessionCmdWithOptions so the
+// call site (not this definition) is the structurally-first reference.
+func forkWithStateWorktree(parentPath, repoRoot, worktreePath, branch string, state git.WorktreeStateOptions, deps forkWithStateWorktreeDeps) error {
+	if state.WithIgnored {
+		state.WithState = true
+	}
+	if !state.WithState {
+		return errors.New("forkWithStateWorktree called without WithState")
+	}
+	// Destination collision is the more actionable refusal, so check it before
+	// the local path-existence guard (mirrors #1263's CLI precedence).
+	if err := deps.validateDestination(repoRoot, branch); err != nil {
+		var collErr *git.DestinationCollisionError
+		if errors.As(err, &collErr) {
+			switch collErr.Kind {
+			case git.CollisionWorktreeExists:
+				return fmt.Errorf("branch %q already has a worktree at %s; choose a new destination branch for --with-state", collErr.Branch, collErr.Path)
+			case git.CollisionBranchExists:
+				return fmt.Errorf("branch %q already exists; choose a new destination branch for --with-state", collErr.Branch)
+			}
+		}
+		return fmt.Errorf("failed to validate destination: %w", err)
+	}
+	if _, statErr := deps.statPath(worktreePath); statErr == nil {
+		return fmt.Errorf("worktree path already exists: %s", worktreePath)
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return fmt.Errorf("failed to stat worktree path: %w", statErr)
+	}
+	kind, detectErr := deps.detectInProgressOperation(parentPath)
+	if detectErr != nil {
+		return fmt.Errorf("failed to inspect parent session state: %w", detectErr)
+	}
+	if kind != "" {
+		abortCmd := map[string]string{
+			"rebase":      "git rebase --abort",
+			"merge":       "git merge --abort",
+			"cherry-pick": "git cherry-pick --abort",
+			"revert":      "git revert --abort",
+			"bisect":      "git bisect reset",
+		}[kind]
+		return fmt.Errorf("parent session is mid-%s; finish or abort the %s before forking with state (cd %q && %s)", kind, kind, parentPath, abortCmd)
+	}
+	if err := deps.mkdirAll(filepath.Dir(worktreePath), 0o755); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
+	if deps.hasSubmodules(parentPath) {
+		uiLog.Warn("fork_with_state_submodules_detected", slog.String("parent", parentPath))
+	}
+	parentHead, err := deps.headCommit(parentPath)
+	if err != nil {
+		return fmt.Errorf("failed to resolve parent session HEAD: %w", err)
+	}
+	createdBranch, err := deps.createAtStartPoint(repoRoot, worktreePath, branch, parentHead)
+	if err != nil {
+		return fmt.Errorf("worktree creation failed: %w", err)
+	}
+	if err := deps.materialize(parentPath, worktreePath, state.WithIgnored); err != nil {
+		var cleanupErrs []string
+		if rmErr := deps.removeWorktree(repoRoot, worktreePath, true); rmErr != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Sprintf("worktree remove failed: %v", rmErr))
+		}
+		if createdBranch {
+			if brErr := deps.deleteBranch(repoRoot, branch, true); brErr != nil {
+				cleanupErrs = append(cleanupErrs, fmt.Sprintf("branch delete failed: %v", brErr))
+			}
+		}
+		if len(cleanupErrs) == 0 {
+			return fmt.Errorf("failed to materialize parent state: %w; new worktree cleaned up", err)
+		}
+		branchHint := ""
+		if createdBranch {
+			branchHint = fmt.Sprintf(" && git -C %q branch -D %q", repoRoot, branch)
+		}
+		return fmt.Errorf("failed to materialize parent state: %w; cleanup also failed (%s); manual cleanup required: rm -rf %q%s", err, strings.Join(cleanupErrs, "; "), worktreePath, branchHint)
+	}
+	if err := deps.processInclude(repoRoot, worktreePath, io.Discard); err != nil {
+		uiLog.Warn("fork_with_state_worktreeinclude_failed", slog.String("path", worktreePath), slog.String("err", err.Error()))
+	}
+	if err := deps.runSetup(repoRoot, worktreePath, io.Discard, io.Discard, session.GetWorktreeSettings().SetupTimeout()); err != nil {
+		// Non-fatal: the worktree and parent state are already created. Mirror
+		// #1263's CLI, which warns on a failed setup script rather than failing
+		// the whole fork.
+		uiLog.Warn("fork_with_state_setup_failed", slog.String("path", worktreePath), slog.String("err", err.Error()))
+	}
+	return nil
+}
+
+// forkWithStateWorkspaceJJ is the jujutsu equivalent of forkWithStateWorktree:
+// it creates the fork's jj workspace anchored at the parent session's committed
+// point (@-) and materializes the parent's uncommitted working-copy state into
+// it. Wired into forkSessionCmdWithOptions for jj backends (#1305).
+//
+// jj's model makes this leaner than git: the working copy is a commit and
+// untracked files are auto-snapshotted, so a single restore carries tracked +
+// untracked state; only gitignored files need a filesystem copy. There is also
+// no staging area or in-progress rebase/merge/cherry-pick state to guard
+// against, so the git path's index/operation safeguards do not apply.
+func forkWithStateWorkspaceJJ(parentPath, repoRoot, workspacePath, branch string, state git.WorktreeStateOptions) error {
+	if state.WithIgnored {
+		state.WithState = true
+	}
+	if !state.WithState {
+		return errors.New("forkWithStateWorkspaceJJ called without WithState")
+	}
+	// Validate the destination (read-only) BEFORE creating any filesystem state,
+	// mirroring the git path (forkWithStateWorktree validates before deps.mkdirAll)
+	// and the jj CLI path (session_cmd.go pre-checks BookmarkExists before its
+	// os.MkdirAll). Otherwise a refused fork would leave an empty worktrees
+	// container dir behind. CreateWorkspaceAtRevision re-checks the bookmark as a
+	// transactional guard — the same defense-in-depth the git path uses.
+	if _, statErr := os.Stat(workspacePath); statErr == nil {
+		return fmt.Errorf("workspace path already exists: %s", workspacePath)
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return fmt.Errorf("failed to stat workspace path: %w", statErr)
+	}
+	if branch != "" {
+		if exists, bmErr := jujutsu.BookmarkExists(repoRoot, branch); bmErr != nil {
+			return fmt.Errorf("failed to validate destination: %w", bmErr)
+		} else if exists {
+			return fmt.Errorf("bookmark %q already exists; choose a new destination branch for --with-state", branch)
+		}
+	}
+	parentBase, err := jujutsu.WorkingCopyParentRevision(parentPath)
+	if err != nil {
+		return fmt.Errorf("failed to resolve parent session committed anchor: %w", err)
+	}
+	// All checks passed — now create the container dir and the workspace.
+	if err := os.MkdirAll(filepath.Dir(workspacePath), 0o755); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
+	if err := jujutsu.CreateWorkspaceAtRevision(repoRoot, workspacePath, branch, parentBase); err != nil {
+		return fmt.Errorf("workspace creation failed: %w", err)
+	}
+	if err := jujutsu.MaterializeWipFromParent(parentPath, workspacePath, state.WithIgnored); err != nil {
+		// Roll back the workspace we just created so a materialize failure does
+		// not leave an orphaned workspace behind — and report accurately whether
+		// that cleanup actually succeeded.
+		if cleanupErr := rollbackForkWithStateWorktree(repoRoot, workspacePath, branch); cleanupErr != nil {
+			return fmt.Errorf("failed to materialize parent state: %w; cleanup also failed (%s); manual cleanup may be required: rm -rf %q", err, cleanupErr, workspacePath)
+		}
+		return fmt.Errorf("failed to materialize parent state: %w; new workspace cleaned up", err)
+	}
+	return nil
 }
 
 // sessionDeletedMsg signals that a session was deleted
@@ -9665,6 +10543,27 @@ func (h *Home) attachSession(inst *session.Instance) tea.Cmd {
 	// Do not synchronously save here; saving on attach blocks transition and causes
 	// visible blank-screen delay before tmux attach starts.
 	inst.MarkAccessed()
+
+	// #1114 follow-up: Claude's /rename fires no agent-deck hook, so an idle
+	// session's title and iTerm2 badge can be stale at attach time (the
+	// hook-driven sync only runs on the next turn boundary). Reconcile from the
+	// agent's current Claude session name here — before tmuxSess.Attach() emits
+	// the badge from DisplayName — so detach/reattach reliably refreshes it.
+	if session.IsClaudeCompatible(inst.Tool) {
+		sessionID := session.ReadHookSessionAnchor(inst.ID)
+		if sessionID == "" {
+			sessionID = inst.ClaudeSessionID
+		}
+		if newName, changed := inst.ReconcileTitleFromClaude(sessionID); changed {
+			h.pendingTitleChanges[inst.ID] = newName
+			h.invalidatePreviewCache(inst.ID)
+			h.rebuildFlatItems()
+			h.saveInstances()
+			uiLog.Info("title_reconciled_on_attach",
+				slog.String("session_id", inst.ID),
+				slog.String("title", newName))
+		}
+	}
 
 	// Acknowledge on ATTACH (not detach) - but ONLY if session is waiting (yellow)
 	// This ensures:
@@ -10181,6 +11080,10 @@ func (h *Home) View() string {
 	// Watcher panel is modal (before settings panel)
 	if h.watcherPanel.IsVisible() {
 		return h.watcherPanel.View()
+	}
+
+	if h.toolVisibilityPanel != nil && h.toolVisibilityPanel.IsVisible() {
+		return h.toolVisibilityPanel.View()
 	}
 
 	// Settings panel is modal
@@ -10865,9 +11768,14 @@ func clampViewToViewport(content string, width, height int) string {
 		// terminal cell count. Any line that slips past upstream gates
 		// with a #️⃣ 0️⃣–9️⃣ *️⃣ glyph would otherwise overflow into the
 		// next row here — exactly @jennings's pane-content drift report.
-		if cellWidth(line) > width {
-			lines[i] = cellTruncate(line, width, "")
-		}
+		//
+		// Also PAD short lines to exactly width (not just truncate long
+		// ones): on incremental redraw a shorter line must overwrite the
+		// full previous row, else the terminal keeps the stale trailing
+		// glyphs — the iTerm2 "ghost line" artifact on session-list scroll
+		// (#607 row-offset drift). fitCellWidth does both, on cellWidth so
+		// this post-join clamp stays a true terminal-cell net.
+		lines[i] = fitCellWidth(line, width)
 	}
 
 	return strings.Join(lines, "\n")
@@ -11266,12 +12174,44 @@ func renderSimpleMCPLine(b *strings.Builder, mcpInfo *session.MCPInfo, width int
 	b.WriteString("\n")
 }
 
-// renderHelpBar renders context-aware keyboard shortcuts, adapting to terminal width
+// renderHelpBar renders context-aware keyboard shortcuts. The style is
+// selected by config.toml [ui] footer (cached in h.footerMode):
+//
+//   - "full" (default): the historic verbose bar with filled key chips, adapting
+//     to terminal width across the tiny/minimal/compact/full tiers. This is also
+//     the fallback for any unset or unrecognized footerMode, so the historic look
+//     is never silently replaced.
+//   - "curated" (opt-in): a lighter, dim inline bar that advertises only the
+//     actions relevant to the selected row, with the settings and help keys
+//     always last. Rarer/global actions live under help (?).
+//   - "compact" / "minimal": force a single verbose tier regardless of width.
+//
+// The very-narrow tiny tier is always used below layoutBreakpointSingle so the
+// bar never overflows, whatever the configured style.
 func (h *Home) renderHelpBar() string {
-	// Route to appropriate tier based on width
-	switch {
-	case h.width < layoutBreakpointSingle:
+	if h.width < layoutBreakpointSingle {
 		return h.renderHelpBarTiny()
+	}
+
+	switch h.footerMode {
+	case session.FooterCurated:
+		return h.renderHelpBarCurated()
+	case session.FooterCompact:
+		return h.renderHelpBarCompact()
+	case session.FooterMinimal:
+		return h.renderHelpBarMinimal()
+	default:
+		// FooterFull, plus any unset ("") or unrecognized mode, routes to the
+		// historic width-adaptive bar. Only an explicit curated setting selects
+		// the curated bar, so the pre-PR default behavior is preserved.
+		return h.renderHelpBarWidthAdaptive()
+	}
+}
+
+// renderHelpBarWidthAdaptive routes to the historic width-based tiers used by
+// the "full" footer style.
+func (h *Home) renderHelpBarWidthAdaptive() string {
+	switch {
 	case h.width < 70:
 		return h.renderHelpBarMinimal()
 	case h.width < 100:
@@ -11355,7 +12295,7 @@ func (h *Home) renderHelpBarMinimal() string {
 		}
 	} else if len(h.flatItems) == 0 {
 		contextKeys = renderKeys(newKey, quickKey, importKey, groupKey)
-	} else if h.cursor < len(h.flatItems) {
+	} else if h.cursor >= 0 && h.cursor < len(h.flatItems) {
 		item := h.flatItems[h.cursor]
 		if item.Type == session.ItemTypeGroup {
 			contextKeys = renderKeys("⏎", newKey, quickKey, groupKey)
@@ -11373,7 +12313,7 @@ func (h *Home) renderHelpBarMinimal() string {
 					contextKeys += " " + forkRendered
 				}
 			}
-			if item.Session != nil && (session.IsClaudeCompatible(item.Session.Tool) || item.Session.Tool == "gemini") {
+			if item.Session != nil && session.ToolSupportsMCPManager(item.Session.Tool) {
 				mcpRendered := renderKeys(mcpKey)
 				if mcpRendered != "" {
 					contextKeys += " " + mcpRendered
@@ -11450,7 +12390,7 @@ func (h *Home) renderHelpBarCompact() string {
 		if key := h.actionKey(hotkeyImport); key != "" {
 			contextHints = append(contextHints, h.helpKeyShort(key, "Import"))
 		}
-	} else if h.cursor < len(h.flatItems) {
+	} else if h.cursor >= 0 && h.cursor < len(h.flatItems) {
 		item := h.flatItems[h.cursor]
 		if item.Type == session.ItemTypeGroup {
 			contextHints = append(contextHints, h.helpKeyShort("⏎", "Toggle"))
@@ -11473,7 +12413,7 @@ func (h *Home) renderHelpBarCompact() string {
 					contextHints = append(contextHints, h.helpKeyShort(key, "Fork"))
 				}
 			}
-			if item.Session != nil && (session.IsClaudeCompatible(item.Session.Tool) || item.Session.Tool == "gemini") {
+			if item.Session != nil && session.ToolSupportsMCPManager(item.Session.Tool) {
 				if key := h.actionKey(hotkeyMCPManager); key != "" {
 					contextHints = append(contextHints, h.helpKeyShort(key, "MCP"))
 				}
@@ -11613,7 +12553,7 @@ func (h *Home) renderHelpBarFull() string {
 		if groupKey != "" {
 			primaryHints = append(primaryHints, h.helpKey(groupKey, "Group"))
 		}
-	} else if h.cursor < len(h.flatItems) {
+	} else if h.cursor >= 0 && h.cursor < len(h.flatItems) {
 		item := h.flatItems[h.cursor]
 		if item.Type == session.ItemTypeGroup {
 			contextTitle = "Group"
@@ -11645,14 +12585,14 @@ func (h *Home) renderHelpBarFull() string {
 			if item.Session != nil && item.Session.CanRestartFresh() && restartFreshKey != "" {
 				primaryHints = append(primaryHints, h.helpKey(restartFreshKey, "Restart Fresh"))
 			}
-			// Only show fork hints if session has a valid Claude session ID
+			// Only show fork hints when the selected tool supports Agent Deck forking.
 			if item.Session != nil && item.Session.CanFork() {
 				if forkKeys != "" {
 					primaryHints = append(primaryHints, h.helpKey(forkKeys, "Fork"))
 				}
 			}
 			// Show MCP Manager and preview mode toggle for Claude and Gemini sessions
-			if item.Session != nil && (session.IsClaudeCompatible(item.Session.Tool) || item.Session.Tool == "gemini") {
+			if item.Session != nil && session.ToolSupportsMCPManager(item.Session.Tool) {
 				if mcpKey != "" {
 					primaryHints = append(primaryHints, h.helpKey(mcpKey, "MCP"))
 				}
@@ -11798,6 +12738,225 @@ func (h *Home) helpKey(key, desc string) string {
 	return keyStyle.Render(key) + " " + descStyle.Render(desc)
 }
 
+// footerHint is one rendered key/label pair for the curated footer.
+type footerHint struct {
+	key   string
+	label string
+}
+
+// curatedHint formats a single footer hint as dim, plain inline text — the key
+// in a slightly emphasized dim, the label in the same dim tone. No filled chip:
+// the curated bar should recede rather than compete for attention.
+func (h *Home) curatedHint(hint footerHint) string {
+	keyStyle := lipgloss.NewStyle().Foreground(ColorComment).Bold(true)
+	labelStyle := lipgloss.NewStyle().Foreground(ColorComment)
+	return keyStyle.Render(hint.key) + " " + labelStyle.Render(hint.label)
+}
+
+// fitCuratedHints returns the global hints (settings/help) preceded by as many
+// of the context hints as fit within h.width, dropping the lowest-priority
+// context hints (those at the end of the slice) first. The global hints are
+// always kept, even if that means dropping every context hint, so the curated
+// footer never loses the settings and help keys to right-edge truncation on a
+// narrow terminal. Widths are measured with lipgloss.Width to match how the
+// joined content is rendered, including the two-space separators.
+func (h *Home) fitCuratedHints(contextHints, globalHints []footerHint) []footerHint {
+	const sepWidth = 2 // the "  " separator between rendered hints
+
+	width := func(hint footerHint) int {
+		return lipgloss.Width(h.curatedHint(hint))
+	}
+
+	// Baseline: the global hints always render. Their combined width is the
+	// floor we cannot trim below.
+	used := 0
+	for i, hint := range globalHints {
+		used += width(hint)
+		if i > 0 {
+			used += sepWidth
+		}
+	}
+
+	// Greedily keep context hints from the front (highest priority) while each
+	// still fits. h.width <= 0 (uninitialized) means "no constraint" — keep all.
+	rendered := used > 0 // whether anything has been counted yet (for separators)
+	kept := make([]footerHint, 0, len(contextHints)+len(globalHints))
+	for _, hint := range contextHints {
+		next := used + width(hint)
+		if rendered {
+			next += sepWidth
+		}
+		if h.width > 0 && next > h.width {
+			break
+		}
+		kept = append(kept, hint)
+		used = next
+		rendered = true
+	}
+
+	return append(kept, globalHints...)
+}
+
+// maxCuratedContextHints caps how many context-relevant shortcuts the curated
+// footer advertises for the selected row. The settings and help keys are added
+// on top of these by renderHelpBarCurated, so the bar stays short while still
+// surfacing the two or three most useful actions for what is highlighted.
+const maxCuratedContextHints = 3
+
+// curatedContextHints returns up to maxCuratedContextHints context-relevant
+// hints for the selected row, in priority order. It advertises the actions most
+// likely to be wanted for the current selection; rarer and global actions stay
+// under help (?). The settings and help keys are added separately by
+// renderHelpBarCurated so they always remain last.
+func (h *Home) curatedContextHints(item session.Item) []footerHint {
+	var hints []footerHint
+	add := func(key, label string) {
+		if len(hints) >= maxCuratedContextHints {
+			return
+		}
+		if strings.TrimSpace(key) != "" {
+			hints = append(hints, footerHint{key: key, label: label})
+		}
+	}
+
+	newQuick := joinHotkeyLabels(h.actionKey(hotkeyNewSession), h.actionKey(hotkeyQuickCreate))
+
+	switch item.Type {
+	case session.ItemTypeGroup:
+		// Group row: collapse/expand first (Tab; also l/h), then create/manage.
+		if item.Group != nil && item.Group.Expanded {
+			add("Tab", "collapse")
+		} else {
+			add("Tab", "expand")
+		}
+		add(newQuick, "new")
+		add(h.actionKey(hotkeyRename), "rename")
+
+	case session.ItemTypeSession:
+		s := item.Session
+		if s == nil {
+			return hints
+		}
+		if sessionIsQueued(s) {
+			// Queued: waiting for a group slot, no tmux yet — so it is neither
+			// attachable (no pane to enter) nor restartable (nothing running to
+			// restart). The only meaningful actions are dropping it from the
+			// queue or creating something else. Without this branch the curated
+			// footer advertised "⏎ attach"+restart for a session that has no
+			// tmux (PR #1289 review nit 2b).
+			add(h.actionKey(hotkeyDelete), "delete")
+			add(newQuick, "new")
+		} else if sessionIsDead(s) {
+			// Dead (stopped or error): restart, then restart-fresh when the
+			// tool tracks a session id, then delete — the actions for a session
+			// that broke or was parked, in order of likely intent.
+			add(h.actionKey(hotkeyRestart), "restart")
+			if s.CanRestartFresh() {
+				add(h.actionKey(hotkeyRestartFresh), "restart fresh")
+			}
+			add(h.actionKey(hotkeyDelete), "delete")
+		} else {
+			// Live/attachable session: attach first, then restart, then the
+			// most relevant follow-up (fork while forkable, else new).
+			add("⏎", "attach")
+			add(h.actionKey(hotkeyRestart), "restart")
+			if s.CanFork() {
+				add(h.actionKey(hotkeyQuickFork), "fork")
+			} else {
+				add(newQuick, "new")
+			}
+		}
+
+	case session.ItemTypeWindow:
+		// A tmux window row attaches just like its session.
+		add("⏎", "attach")
+
+	case session.ItemTypeRemoteSession:
+		// A remote session row attaches over SSH just like a local session;
+		// without this case the curated footer dropped the attach hint for
+		// remote rows (PR #1289 review nit 1).
+		add("⏎", "attach")
+	}
+
+	return hints
+}
+
+// sessionIsDead reports whether a session is stopped or errored — the states
+// for which restart, rather than attach, is the relevant footer action. Reads
+// the status via the thread-safe getter since the render goroutine runs
+// concurrently with backgroundStatusUpdate (PR #1289 review nit 2).
+func sessionIsDead(s *session.Instance) bool {
+	status := s.GetStatusThreadSafe()
+	return status == session.StatusStopped || status == session.StatusError
+}
+
+// sessionIsQueued reports whether a session is waiting for a group slot and has
+// no tmux yet — so it is neither attachable nor restartable. Reads the status
+// via the thread-safe getter for the same concurrency reason as sessionIsDead.
+func sessionIsQueued(s *session.Instance) bool {
+	return s.GetStatusThreadSafe() == session.StatusQueued
+}
+
+// renderHelpBarCurated renders the lighter, context-aware footer (the default
+// "curated" style). It shows dim, plain inline hints for only the actions
+// relevant to the selected row, and always keeps the settings key then the help
+// key as the last two items. It advertises nothing that the verbose bar bound —
+// every action remains reachable by its key and is fully listed under help (?).
+func (h *Home) renderHelpBarCurated() string {
+	borderStyle := lipgloss.NewStyle().Foreground(ColorBorder)
+	border := borderStyle.Render(strings.Repeat("─", max(0, h.width)))
+
+	// Context hints (jump / empty-list / selected-row actions) are
+	// lower-priority and listed in descending priority order, so they are the
+	// ones dropped first when the bar is too narrow.
+	var contextHints []footerHint
+
+	switch {
+	case h.jumpMode:
+		contextHints = append(contextHints, footerHint{key: "a-z", label: "jump"}, footerHint{key: "esc", label: "cancel"})
+	case len(h.flatItems) == 0:
+		// Empty list: the useful actions all create something — new session,
+		// import, or a group. Cap at the same budget as context hints.
+		add := func(key, label string) {
+			if len(contextHints) >= maxCuratedContextHints {
+				return
+			}
+			if strings.TrimSpace(key) != "" {
+				contextHints = append(contextHints, footerHint{key: key, label: label})
+			}
+		}
+		add(joinHotkeyLabels(h.actionKey(hotkeyNewSession), h.actionKey(hotkeyQuickCreate)), "new")
+		add(h.actionKey(hotkeyImport), "import")
+		add(h.actionKey(hotkeyCreateGroup), "group")
+	case h.cursor >= 0 && h.cursor < len(h.flatItems):
+		contextHints = append(contextHints, h.curatedContextHints(h.flatItems[h.cursor])...)
+	}
+
+	// Settings then help are the always-kept global hints, in that order. They
+	// are never dropped: when the terminal is too narrow, lower-priority context
+	// hints are trimmed from the right instead so these two always survive
+	// (PR #1289 review nit 2a — previously MaxWidth truncation could clip them).
+	var globalHints []footerHint
+	if key := h.actionKey(hotkeySettings); key != "" {
+		globalHints = append(globalHints, footerHint{key: key, label: "settings"})
+	}
+	if key := h.actionKey(hotkeyHelp); key != "" {
+		globalHints = append(globalHints, footerHint{key: key, label: "help"})
+	}
+
+	hints := h.fitCuratedHints(contextHints, globalHints)
+
+	parts := make([]string, 0, len(hints))
+	for _, hint := range hints {
+		parts = append(parts, h.curatedHint(hint))
+	}
+	sepStyle := lipgloss.NewStyle().Foreground(ColorBorder)
+	content := strings.Join(parts, sepStyle.Render("  "))
+
+	raw := lipgloss.JoinVertical(lipgloss.Left, border, content)
+	return lipgloss.NewStyle().MaxWidth(h.width).Render(raw)
+}
+
 // renderDebugBar renders a compact performance overlay for debug mode.
 // Shows: render time, goroutine count, heap usage, session count.
 func (h *Home) renderDebugBar() string {
@@ -11911,7 +13070,7 @@ func (h *Home) renderSessionList(width, height int) string {
 		if h.jumpMode && i < len(jumpHints) {
 			// Render item to temp buffer, then overlay hint badge at name position
 			var itemBuf strings.Builder
-			h.renderItem(&itemBuf, item, i == h.cursor, i, groupStats, snapshot)
+			h.renderItem(&itemBuf, item, i == h.cursor, i, groupStats, snapshot, width)
 			raw := itemBuf.String()
 			hint := jumpHints[i]
 			isMatch := h.jumpBuffer == "" || strings.HasPrefix(hint, h.jumpBuffer)
@@ -11931,7 +13090,7 @@ func (h *Home) renderSessionList(width, height int) string {
 				b.WriteString(raw)
 			}
 		} else {
-			h.renderItem(&b, item, i == h.cursor, i, groupStats, snapshot)
+			h.renderItem(&b, item, i == h.cursor, i, groupStats, snapshot, width)
 		}
 		visibleCount++
 	}
@@ -12009,6 +13168,7 @@ func (h *Home) renderItem(
 	itemIndex int,
 	groupStats map[string]groupRenderStats,
 	snapshot map[string]sessionRenderState,
+	listWidth int,
 ) {
 	switch item.Type {
 	case session.ItemTypeGroup:
@@ -12017,7 +13177,7 @@ func (h *Home) renderItem(
 		if item.CreatingID != "" {
 			h.renderCreatingSessionItem(b, item, selected)
 		} else {
-			h.renderSessionItem(b, item, selected, snapshot)
+			h.renderSessionItem(b, item, selected, snapshot, listWidth)
 		}
 	case session.ItemTypeWindow:
 		h.renderWindowItem(b, item, selected)
@@ -12195,11 +13355,17 @@ func (h *Home) renderCreatingSessionItem(
 	b.WriteString("\n")
 }
 
+// renderSessionItem renders a single session row into b, including the tree
+// connector, status badge, tool label, and the dim tmux pane-title suffix.
+// The pane-title suffix appears on the selected row, or on every row when
+// show_pane_titles is enabled, and is truncated to listWidth so it never
+// overflows the SESSIONS panel.
 func (h *Home) renderSessionItem(
 	b *strings.Builder,
 	item session.Item,
 	selected bool,
 	snapshot map[string]sessionRenderState,
+	listWidth int,
 ) {
 	inst := item.Session
 
@@ -12334,6 +13500,16 @@ func (h *Home) renderSessionItem(
 		if opts := inst.GetCodexOptions(); opts != nil && opts.YoloMode != nil && *opts.YoloMode {
 			showYolo = true
 		}
+	} else if instTool == "hermes" {
+		// Mirror the toggle path's resolution: per-session override wins; otherwise
+		// fall back to the global [hermes].yolo_mode in user config. Without the
+		// fallback the badge lies about state for sessions launched with YOLO via
+		// global config but no per-session override.
+		if opts := inst.GetHermesOptions(); opts != nil && opts.YoloMode != nil {
+			showYolo = *opts.YoloMode
+		} else if cfg, _ := session.LoadUserConfig(); cfg != nil && cfg.Hermes.YoloMode {
+			showYolo = true
+		}
 	}
 	if showYolo {
 		yoloStyle := lipgloss.NewStyle().Foreground(ColorYellow).Bold(true)
@@ -12392,6 +13568,24 @@ func (h *Home) renderSessionItem(
 		sshBadge = sshStyle.Render(" [ssh:" + host + "]")
 	}
 
+	// Last-update timestamp badge — see pickBadgeTime for the formula.
+	// Selected rows reuse the selection-bar style instead of dim, so the
+	// badge stays legible inside the highlight.
+	timestampBadge := ""
+	if h.showSessionTimestamps {
+		tsStyle := DimStyle
+		if selected {
+			tsStyle = SessionStatusSelStyle
+		}
+		var hookStatus *session.HookStatus
+		if h.hookWatcher != nil {
+			hookStatus = h.hookWatcher.GetHookStatus(inst.ID)
+		}
+		confirmedTs, confirmedObserved := inst.LastObservedActivity()
+		ts := pickBadgeTime(inst.CreatedAt, inst.LastStartedAt, hookStatus, confirmedTs, confirmedObserved)
+		timestampBadge = tsStyle.Render(" " + formatRelativeTime(ts))
+	}
+
 	// Window expand/collapse chevron for sessions with 2+ windows
 	windowChevron := " " // space placeholder to keep status icons aligned
 	if h.sessionHasWindows(item) {
@@ -12408,7 +13602,7 @@ func (h *Home) renderSessionItem(
 
 	// Build row: [baseIndent][selection][tree][chevron][status] [title] [tool] [badges]
 	row := fmt.Sprintf(
-		"%s%s%s%s%s %s%s%s%s%s%s%s",
+		"%s%s%s%s%s %s%s%s%s%s%s%s%s",
 		baseIndent,
 		selectionPrefix,
 		treeStyle.Render(treeConnector),
@@ -12421,6 +13615,7 @@ func (h *Home) renderSessionItem(
 		sandboxBadge,
 		multiRepoBadge,
 		sshBadge,
+		timestampBadge,
 	)
 
 	// Append pane title filling remaining row space (only for the selected item).
@@ -12431,8 +13626,12 @@ func (h *Home) renderSessionItem(
 	// so the prior measurement let the trailing pane-title text overflow
 	// the panel and shove subsequent rows down by one cell. See
 	// internal/ui/cellwidth.go for the upstream disagreement.
-	if selected && instState.paneTitle != "" {
-		remaining := h.width - cellWidth(row) - 2 // -2 for trailing margin
+	if (selected || h.showPaneTitles) && instState.paneTitle != "" {
+		// Dual layout: sidebar is narrower than h.width (#937). Using full
+		// terminal width here overflows the SESSIONS pane, then lipgloss
+		// truncation disagrees from terminal cells — wrapped lines duplicate
+		// rows visually and mouseY→item indexing breaks until scroll settles.
+		remaining := listWidth - cellWidth(row) - 2 // -2 for trailing margin
 		if remaining > 10 {
 			pt := instState.paneTitle
 			if cellWidth(pt) > remaining {
@@ -13020,13 +14219,16 @@ func (h *Home) renderSessionInfoCard(inst *session.Instance, width, height int) 
 	// Tool
 	b.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Tool:"), valueStyle.Render(cardTool)))
 
-	// Session ID (if available) - Claude, Gemini, or OpenCode
+	// Session ID (if available) - Claude, Gemini, OpenCode, or generic (Hermes/custom tools)
 	sessionID := inst.ClaudeSessionID
 	if sessionID == "" {
 		sessionID = inst.GeminiSessionID
 	}
 	if sessionID == "" {
 		sessionID = inst.OpenCodeSessionID
+	}
+	if sessionID == "" {
+		sessionID = inst.GetGenericSessionID()
 	}
 	if sessionID != "" {
 		shortID := sessionID
@@ -13508,6 +14710,23 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			b.WriteString("\n")
 			renderLaunchModelInfoLines(&b, selected)
 		}
+	}
+
+	// Cursor Agent CLI — MCP configuration for `cursor agent`
+	if selected.Tool == "cursor" {
+		cursorHeader := renderSectionDivider("Cursor", width-4)
+		b.WriteString(cursorHeader)
+		b.WriteString("\n")
+
+		labelStyle := lipgloss.NewStyle().Foreground(ColorText)
+		valueStyle := lipgloss.NewStyle().Foreground(ColorText)
+		b.WriteString(labelStyle.Render("Tool:    "))
+		b.WriteString(valueStyle.Render("Cursor Agent CLI"))
+		b.WriteString("\n")
+		renderLaunchModelInfoLines(&b, selected)
+
+		mcpInfo := selected.GetMCPInfo()
+		renderSimpleMCPLine(&b, mcpInfo, width)
 	}
 
 	// OpenCode-specific info (session ID)
@@ -14397,6 +15616,27 @@ func truncatePath(path string, maxLen int) string {
 		return cellTruncate(path, maxLen-3, "...")
 	}
 	return string(runes[:startLen]) + "..." + string(runes[len(runes)-endLen:])
+}
+
+// pickBadgeTime returns the most recent of the four signals the session-row
+// timestamp badge layers over, ignoring any signal that is unset / not
+// observed. Pure function — kept out of renderSessionItem so the 4-layer
+// composition can be unit-tested without faking renderer dependencies.
+//
+// LastAccessedAt is deliberately not a parameter: peeking at a quiet
+// session isn't an "update".
+func pickBadgeTime(createdAt, lastStartedAt time.Time, hookEvent *session.HookStatus, confirmedActivity time.Time, confirmedObserved bool) time.Time {
+	ts := createdAt
+	if lastStartedAt.After(ts) {
+		ts = lastStartedAt
+	}
+	if hookEvent != nil && hookEvent.UpdatedAt.After(ts) {
+		ts = hookEvent.UpdatedAt
+	}
+	if confirmedObserved && confirmedActivity.After(ts) {
+		ts = confirmedActivity
+	}
+	return ts
 }
 
 // formatRelativeTime formats a time as a human-readable relative string

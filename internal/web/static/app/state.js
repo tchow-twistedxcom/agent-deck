@@ -82,6 +82,12 @@ export const confirmDialogSignal = signal(null)
 // groupNameDialogSignal: null or { mode: 'create'|'rename', groupPath: string, currentName: string, onSubmit: function }
 export const groupNameDialogSignal = signal(null)
 
+// editSessionDialogSignal: null or { sessionId: string }
+// Mirrors the TUI EditSessionDialog (internal/ui/edit_session_dialog.go) —
+// opens a modal that PATCHes /api/sessions/{id}. Closes "Edit session
+// settings" MISSING row in tests/web/PARITY_MATRIX.md.
+export const editSessionDialogSignal = signal(null)
+
 // WebSocket connection state for terminal: 'disconnected' | 'connecting' | 'connected' | 'error'
 export const wsStateSignal = signal('disconnected')
 
@@ -132,6 +138,18 @@ export const toastHistoryOpenSignal = signal(false)
 // 403 error spam. Defaults to true (optimistic) until AppShell mount fetches
 // /api/settings and assigns the real value.
 export const mutationsEnabledSignal = signal(true)
+
+// show_only_installed_tools filter (issue #1259), hydrated from /api/settings
+// alongside webMutations. toolFilterSignal: the flag is on. visibleToolsSignal:
+// the set of tool names that resolved on PATH; the new-session dialog intersects
+// its static tool list against this when the filter is on. toolFilterFallback:
+// nothing but shell resolved, so the dialog shows all tools plus a hint. Defaults
+// keep the dialog showing every tool until the real values arrive.
+export const toolFilterSignal = signal(false)
+export const visibleToolsSignal = signal([])
+export const toolFilterFallbackSignal = signal(false)
+export const hiddenToolsSignal = signal([])
+export const pickerToolsSignal = signal([])
 
 // POL-1 (Phase 9, plan 01): sidebar load state for skeleton render gate.
 // Initialized false; flipped to true on the first /api/menu response OR the

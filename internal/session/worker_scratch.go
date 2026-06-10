@@ -27,7 +27,7 @@
 //
 // Cleanup. `CleanupWorkerScratchConfigDir` removes the dir on
 // session stop/remove — best-effort, no-op on first-time misses. The
-// scratch dir lives under `~/.agent-deck/worker-scratch/<instance-id>/`.
+// scratch dir lives under the effective worker-scratch data directory.
 
 package session
 
@@ -254,16 +254,29 @@ func computeAllowList(i *Instance) []string {
 	return out
 }
 
-// WorkerScratchDirRoot returns the path that holds every worker's
-// scratch config dir. Callers with a valid home should prefer
-// workerScratchDirFor below which derives this from the effective
-// HOME at call time.
-func workerScratchDirRoot(home string) string {
-	return filepath.Join(home, ".agent-deck", "worker-scratch")
+// WorkerScratchDirRoot returns the worker-scratch root resolved through the XDG
+// data path (~/.local/share/agent-deck/worker-scratch, or the legacy
+// ~/.agent-deck/worker-scratch fallback). It is the exported entry point used by
+// the S5 path-safety guard test so the guard can confirm this sink does not
+// resolve under the real home when un-sandboxed.
+func WorkerScratchDirRoot() (string, error) {
+	return workerScratchDirRoot(), nil
 }
 
-func workerScratchDirFor(home, instanceID string) string {
-	return filepath.Join(workerScratchDirRoot(home), instanceID)
+// workerScratchDirRoot returns the path that holds every worker's scratch config
+// dir. It resolves purely through the XDG data path (dataPath), so it does NOT
+// require HOME to be set: an XDG-only environment with an absolute
+// XDG_DATA_HOME and no HOME still resolves correctly.
+func workerScratchDirRoot() string {
+	dir, err := dataPath("worker-scratch", "worker-scratch")
+	if err != nil {
+		return filepath.Join(os.TempDir(), "agent-deck", "worker-scratch")
+	}
+	return dir
+}
+
+func workerScratchDirFor(instanceID string) string {
+	return filepath.Join(workerScratchDirRoot(), instanceID)
 }
 
 // EnsureWorkerScratchConfigDir idempotently prepares the scratch
@@ -280,11 +293,7 @@ func (i *Instance) EnsureWorkerScratchConfigDir(sourceProfileDir string) (string
 		return "", fmt.Errorf("EnsureWorkerScratchConfigDir: instance has no ID")
 	}
 
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("resolve home: %w", err)
-	}
-	scratch := workerScratchDirFor(home, i.ID)
+	scratch := workerScratchDirFor(i.ID)
 
 	// 0o700: scratch settings.json holds plugin topology that shouldn't
 	// be world-readable on a multi-user host.
@@ -421,25 +430,40 @@ func mirrorProfileEntries(dest, source string) error {
 	return reassertCredentialSymlink(dest, source)
 }
 
-// reassertCredentialSymlink guarantees dest/.credentials.json is a symlink to
-// source/.credentials.json (the canonical profile credentials), healing the
-// in-session `/login` clobber described in issue #1222.
+// reassertCredentialSymlink guarantees dest/.credentials.json is a clean symlink
+// to source/.credentials.json (the single canonical profile credentials),
+// healing the in-session `/login` clobber described in issue #1222.
 //
 //   - dest entry is the correct symlink → left untouched (idempotent).
 //   - dest entry is absent → symlinked to canonical (when canonical exists).
 //   - dest entry is a symlink to the WRONG target → repointed to canonical.
-//   - dest entry is a real file STALE relative to canonical → replaced with
-//     the symlink; canonical is the source of truth and is left unchanged.
-//   - dest entry is a real file NEWER than canonical (a fresh in-session
-//     `/login`) → its contents are atomically promoted to canonical FIRST
-//     (temp+rename, 0600 token perms preserved, canonical never torn), THEN
-//     dest is replaced with the symlink — so the fresh token propagates to
-//     every symlinked session instead of being stranded in this scratch.
+//   - dest entry is a REAL FILE (the `/login` clobber, or any diverged copy) →
+//     force-replaced with a symlink to canonical, regardless of mtime.
+//     Canonical is NEVER overwritten.
+//   - dest entry is a real file but canonical is ABSENT → left intact, so the
+//     only token copy is not stranded behind a dangling symlink. The next
+//     start, once canonical exists, replaces it with the symlink.
+//
+// Why no mtime-promote (removed; see the OAuth root-cause memo and the
+// disassembly of Claude v2.1.159 in /tmp/oauth-fix/SUBSCRIPTION-FIX.md):
+// Anthropic OAuth uses single-use ROTATING refresh tokens, so a scratch copy's
+// mtime is NOT a "this token is newer/valid" signal. The previous code promoted
+// a strictly-newer scratch real-file to canonical, which could overwrite a good
+// canonical with a stale (or already-rotated-out) scratch token and fork a
+// second rotation chain — re-introducing the `invalid_grant` /login race for
+// every session sharing that profile. Claude re-reads .credentials.json on
+// expiry and serializes refreshes on a cross-process lock keyed by
+// realpath(); collapsing every scratch to ONE canonical symlink is what makes
+// that lock actually serialize the workers. The load-bearing invariant is
+// therefore "the scratch credentials must always be a symlink to the one
+// canonical file, never a real file", and we enforce it on every
+// spawn/start/restart here.
 //
 // WARNING for operators: do NOT run `/login` inside a managed agent-deck
-// session. Log in once in the canonical profile and every session inherits it
-// through this symlink. An in-session login is recovered here on the next
-// start, but only after a restart.
+// session — it writes a real file that diverges from canonical until the next
+// restart relinks it (the in-session token is dropped, NOT promoted). Log in
+// once in the canonical profile (e.g. `CLAUDE_CONFIG_DIR=~/.claude claude` →
+// /login) and every session inherits it through this symlink.
 func reassertCredentialSymlink(dest, source string) error {
 	target := filepath.Join(source, credentialsFileName)
 	linkPath := filepath.Join(dest, credentialsFileName)
@@ -468,32 +492,18 @@ func reassertCredentialSymlink(dest, source string) error {
 		return symlinkReplace(target, linkPath)
 	}
 
-	// dest is a REAL FILE (the `/login` clobber). Decide promote vs relink.
-	promote := false
-	ti, terr := os.Stat(target)
-	switch {
-	case terr != nil && os.IsNotExist(terr):
-		promote = true // canonical missing → scratch is the only copy
-	case terr != nil:
+	// dest is a REAL FILE — the `/login` clobber, or a diverged copy. Always
+	// force-replace it with a clean symlink to canonical; NEVER promote its
+	// contents (mtime is not a valid-token signal for rotating tokens).
+	if _, terr := os.Stat(target); terr != nil {
+		if os.IsNotExist(terr) {
+			// No canonical to point at — leave the only token copy intact
+			// rather than stranding it behind a dangling symlink. Once the
+			// user logs in to canonical, the next start relinks this.
+			return nil
+		}
 		return fmt.Errorf("stat canonical credentials: %w", terr)
-	default:
-		// Promote only when the scratch copy is strictly newer — a fresh
-		// in-session login. Equal/older is treated as stale (relink only).
-		promote = li.ModTime().After(ti.ModTime())
 	}
-
-	if promote {
-		data, rerr := os.ReadFile(linkPath)
-		if rerr != nil {
-			return fmt.Errorf("read scratch credentials for promote: %w", rerr)
-		}
-		// Atomic temp+rename into canonical: 0600 token perms preserved,
-		// canonical never torn even under a concurrent reader (G5/G1).
-		if err := atomicWriteFile(target, data, 0o600); err != nil {
-			return fmt.Errorf("promote scratch credentials to canonical: %w", err)
-		}
-	}
-
 	return symlinkReplace(target, linkPath)
 }
 
@@ -625,9 +635,8 @@ var macOSScratchWarningEmitter func(sourceProfileDir string) = emitMacOSScratchW
 
 // maybeEmitMacOSScratchWarning is a no-op on non-darwin and a one-shot
 // per-(host, sourceProfileDir) pair on darwin. Cache lives in
-// `~/.agent-deck/state.json` under the key
-// `macos_plugin_scratch_warning_shown[<sourceProfileDir>]` so a second
-// session re-using the same source profile silently skips the warning.
+// the effective data directory so a second session re-using the same
+// source profile silently skips the warning.
 //
 // Best-effort: state-file errors (read or write) do NOT block the
 // session. Worst case: warning is shown twice.
@@ -654,18 +663,14 @@ func goosNative() string { return runtime.GOOS }
 
 // macOSWarningStateFile is the single-flag JSON state file recording
 // which source profile dirs already showed the macOS plugin-scratch
-// warning. Lives at `~/.agent-deck/macos-plugin-warning-state.json`.
+// warning. Lives in the effective data directory.
 //
 // Schema: { "shown": { "<source-profile-dir>": true, ... } }
 //
 // Best-effort everywhere — read errors degrade to "not yet shown",
 // write errors degrade to "may show twice". No mandate-level guard.
 func macOSWarningStateFile() (string, error) {
-	dir, err := GetAgentDeckDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "macos-plugin-warning-state.json"), nil
+	return dataPath("macos-plugin-warning-state.json", "macos-plugin-warning-state.json")
 }
 
 type macosWarningState struct {
