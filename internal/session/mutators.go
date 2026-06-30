@@ -36,6 +36,15 @@ const (
 	FieldUseChrome          = "use-chrome"   // add --chrome (incompatible with use-happy)
 	FieldAccount            = "account"      // #924 per-session named account slot
 	FieldIdleTimeout        = "idle-timeout" // #1143 auto-stop dormant sessions
+	FieldPin                = "pin"          // pin-sessions: anchor top/bottom of group
+	// FieldModel persists the operator's selected per-session model (#1436,
+	// follow-up to #1431). Tool-agnostic: routes to each tool's existing model
+	// store (ClaudeOptions.Model, GeminiModel, OpenCodeOptions.Model,
+	// CodexOptions.Model) via Instance.ApplyLaunchModel, so a model switched
+	// after launch survives `session restart` instead of reverting to the
+	// baked/default model. Restart-required (the running process keeps the
+	// model it launched with).
+	FieldModel = "model"
 )
 
 var ValidMutableFields = []string{
@@ -61,6 +70,8 @@ var ValidMutableFields = []string{
 	FieldUseChrome,
 	FieldAccount,
 	FieldIdleTimeout,
+	FieldPin,
+	FieldModel,
 }
 
 type FieldRestartPolicy int
@@ -73,7 +84,7 @@ const (
 func RestartPolicyFor(field string) FieldRestartPolicy {
 	switch field {
 	case FieldCommand, FieldWrapper, FieldTool, FieldChannels, FieldPlugins, FieldExtraArgs, FieldPath,
-		FieldSkipPermissions, FieldAutoMode, FieldUseHappy, FieldUseChrome, FieldAccount:
+		FieldSkipPermissions, FieldAutoMode, FieldUseHappy, FieldUseChrome, FieldAccount, FieldModel:
 		return FieldRestartRequired
 	default:
 		return FieldLive
@@ -133,6 +144,7 @@ func SetField(inst *Instance, field, value string, extraArgsTokens []string) (ol
 	case FieldTitle:
 		oldValue = inst.Title
 		inst.Title = value
+		inst.SetAutoName(false) // a user/explicit name replaces the auto handle
 		// An explicit rename is user intent: lock the title so the #572
 		// Claude-name sync (plan titles, /rename) can't revert it on the
 		// next hook event. Unlock via `session set <id> title-locked false`.
@@ -374,6 +386,44 @@ func SetField(inst *Instance, field, value string, extraArgsTokens []string) (ol
 			return oldValue, nil, &MutationError{Field: field, Msg: perr.Error()}
 		}
 		inst.IdleTimeoutSecs = secs
+
+	case FieldModel:
+		// #1436: persist the operator's selected model into the tool-specific
+		// store each builder already reads on start/restart. The restart-side
+		// consumption already prefers this per-session model over
+		// [claude].default_model (#1431). Empty value clears the override (back
+		// to the configured default). Restart-required — the running process
+		// keeps the model it launched with.
+		if !SupportsLaunchModel(inst.Tool) {
+			return "", nil, &MutationError{
+				Field: field,
+				Msg:   fmt.Sprintf("model selection is not supported for tool %q", inst.Tool),
+			}
+		}
+		oldValue = inst.LaunchModelID()
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			if cerr := inst.ClearLaunchModel(); cerr != nil {
+				return oldValue, nil, &MutationError{Field: field, Msg: cerr.Error()}
+			}
+		} else if aerr := inst.ApplyLaunchModel(trimmed); aerr != nil {
+			return oldValue, nil, &MutationError{Field: field, Msg: aerr.Error()}
+		}
+
+	case FieldPin:
+		// pin-sessions: anchor the session to the top/bottom of its group,
+		// exempt from the status/recency sort. "" clears the pin. Live: the
+		// next rebuildFlatItems re-sorts and the row lands in its band.
+		oldValue = string(inst.Pin)
+		switch PinMode(strings.TrimSpace(value)) {
+		case PinNone, PinTop, PinBottom:
+			inst.Pin = PinMode(strings.TrimSpace(value))
+		default:
+			return oldValue, nil, &MutationError{
+				Field: field,
+				Msg:   fmt.Sprintf("invalid pin %q — expected 'top', 'bottom', or '' to unpin", value),
+			}
+		}
 
 	default:
 		return "", nil, &MutationError{

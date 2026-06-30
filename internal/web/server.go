@@ -107,6 +107,8 @@ type SessionMutator interface {
 	// CloseSession stops the session process while keeping its metadata
 	// in storage (TUI Shift+D — non-destructive close).
 	CloseSession(sessionID string) error
+	ArchiveSession(sessionID string) error
+	UnarchiveSession(sessionID string) error
 	ForkSession(sessionID string) (string, error)
 	// UndoDelete restores the most-recently deleted session if it was
 	// deleted within the implementation's undo window. Returns the
@@ -227,6 +229,7 @@ func NewServer(cfg Config) *Server {
 	// ServeMux precedence routes it cleanly instead of treating
 	// "undelete" as a sessionID.
 	mux.HandleFunc("POST /api/sessions/undelete", s.handleSessionUndelete)
+	mux.HandleFunc("/api/sessions/archived", s.handleArchivedSessions)
 	mux.HandleFunc("/api/sessions/", s.handleSessionByAction)
 	mux.HandleFunc("/api/groups", s.handleGroupsCollection)
 	mux.HandleFunc("/api/groups/", s.handleGroupByPath)
@@ -238,6 +241,13 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("/api/push/presence", s.handlePushPresence)
 	mux.HandleFunc("/events/menu", s.handleMenuEvents)
 	mux.HandleFunc("/ws/session/", s.handleSessionWS)
+
+	// Command Center (the embedded live fleet god-view — see
+	// conductor/agent-deck/COMMAND-CENTER-DESIGN.md). Two read endpoints and
+	// one write endpoint, all behind the existing authorize/CSRF/mutation gates.
+	mux.HandleFunc("/api/command-center/status", s.handleCommandCenterStatus)
+	mux.HandleFunc("/events/command-center", s.handleCommandCenterEvents)
+	mux.HandleFunc("POST /api/command-center/ask", s.handleCommandCenterAsk)
 
 	mux.HandleFunc("/api/costs/summary", s.handleCostsSummary)
 	mux.HandleFunc("/api/costs/daily", s.handleCostsDaily)
@@ -419,6 +429,15 @@ func (s *Server) notifyMenuChanged() {
 		}
 	}
 	s.menuSubscribersMu.Unlock()
+
+	// Invalidate the MemoryMenuData cache so the next LoadMenuSnapshot()
+	// reloads from the storage-backed fallback. In headless (--no-tui) mode
+	// there is no TUI loop to call publishWebMenuSnapshot(), so without this
+	// the menu snapshot would remain frozen at its first-load state and new
+	// sessions created via the API would never appear until server restart.
+	if mmd, ok := s.menuData.(*MemoryMenuData); ok {
+		mmd.InvalidateCache()
+	}
 }
 
 // checkMutationsAllowed writes a 403 response and returns false when web mutations are disabled.

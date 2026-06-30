@@ -8,6 +8,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+func boolPtr(v bool) *bool { return &v }
+
 func setSettingsPanelHotkeyConfigForTest(t *testing.T, tomlBody string) {
 	t.Helper()
 
@@ -72,16 +74,16 @@ func TestSettingsPanel_LoadConfig(t *testing.T) {
 			YoloMode: true,
 		},
 		Updates: session.UpdateSettings{
-			CheckEnabled: false,
+			CheckEnabled: boolPtr(false),
 			AutoUpdate:   true,
 		},
 		Logs: session.LogSettings{
 			MaxSizeMB:     20,
 			MaxLines:      5000,
-			RemoveOrphans: false,
+			RemoveOrphans: boolPtr(false),
 		},
 		GlobalSearch: session.GlobalSearchSettings{
-			Enabled:    true,
+			Enabled:    boolPtr(true),
 			Tier:       "instant",
 			RecentDays: 60,
 		},
@@ -294,7 +296,7 @@ func TestSettingsPanel_GetConfig(t *testing.T) {
 	if !config.Codex.YoloMode {
 		t.Error("Codex.YoloMode should be true")
 	}
-	if config.Updates.CheckEnabled {
+	if config.Updates.GetCheckEnabled() {
 		t.Error("CheckEnabled should be false")
 	}
 	if !config.Updates.AutoUpdate {
@@ -306,11 +308,11 @@ func TestSettingsPanel_GetConfig(t *testing.T) {
 	if config.Logs.MaxLines != 8000 {
 		t.Errorf("MaxLines: got %d, want 8000", config.Logs.MaxLines)
 	}
-	if config.Logs.RemoveOrphans {
-		t.Error("RemoveOrphans should be false")
+	if config.Logs.RemoveOrphans == nil || *config.Logs.RemoveOrphans {
+		t.Error("RemoveOrphans should be *false")
 	}
-	if !config.GlobalSearch.Enabled {
-		t.Error("GlobalSearch.Enabled should be true")
+	if config.GlobalSearch.Enabled == nil || !*config.GlobalSearch.Enabled {
+		t.Error("GlobalSearch.Enabled should be *true")
 	}
 	if config.GlobalSearch.Tier != "balanced" {
 		t.Errorf("Tier: got %q, want %q", config.GlobalSearch.Tier, "balanced")
@@ -960,9 +962,10 @@ func TestSettingsPanel_Worktree_GetConfigPreservesHiddenFields(t *testing.T) {
 
 	branchPrefix := "dev/"
 	pathTemplate := "~/worktrees/{repo-name}/{branch}"
+	autoCleanupTrue := true
 	original := &session.UserConfig{
 		Worktree: session.WorktreeSettings{
-			AutoCleanup:     true,
+			AutoCleanup:     &autoCleanupTrue,
 			DefaultEnabled:  true,
 			DefaultLocation: "sibling",
 			PathTemplate:    &pathTemplate,
@@ -974,7 +977,7 @@ func TestSettingsPanel_Worktree_GetConfigPreservesHiddenFields(t *testing.T) {
 
 	config := panel.GetConfig()
 
-	if !config.Worktree.AutoCleanup {
+	if config.Worktree.AutoCleanup == nil || !*config.Worktree.AutoCleanup {
 		t.Fatal("Worktree.AutoCleanup should be preserved")
 	}
 	if !config.Worktree.DefaultEnabled {

@@ -2,9 +2,13 @@
 // Vanilla JS imports these and sets .value on SSE updates.
 // Preact components import these and read .value reactively.
 import { signal } from '@preact/signals'
+import { apiFetch } from './api.js'
 
 // Session data from SSE snapshot
 export const sessionsSignal = signal([])
+
+// Archived sessions from GET /api/sessions/archived
+export const archivedSessionsSignal = signal([])
 
 // Currently selected session ID
 export const selectedIdSignal = signal(null)
@@ -169,3 +173,19 @@ export const profilesSignal = signal(null)
 // this for live CPU / memory / network indicators. Defaults to null until
 // the first poll lands; consumers handle the null case.
 export const systemStatsSignal = signal(null)
+
+// Command Center snapshot from the /events/command-center SSE feed (the
+// embedded live fleet god-view — see COMMAND-CENTER-DESIGN.md). Shape:
+// { profile, generatedAt, conductors[], totals, decisionsWaiting[],
+//   recentlyCompleted[], askTargets[] }. Defaults to null until the first
+// SSE snapshot lands; the pane handles the null case with a skeleton.
+export const commandCenterSignal = signal(null)
+
+export async function loadArchivedSessions() {
+  try {
+    const data = await apiFetch('GET', '/api/sessions/archived')
+    archivedSessionsSignal.value = data.sessions || []
+  } catch (_) {
+    archivedSessionsSignal.value = []
+  }
+}

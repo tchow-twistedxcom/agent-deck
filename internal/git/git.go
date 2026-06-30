@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -586,6 +587,14 @@ func RemoveWorktree(repoDir, worktreePath string, force bool) error {
 		return errors.New("not a git repository")
 	}
 
+	// Pre-removal hook: run .agent-deck/worktree-destruction.sh while the
+	// worktree still exists. Gated on IsLinkedWorktree so it never fires for
+	// the main working tree (worktree_reuse sessions, #1200) or non-worktree
+	// paths. Non-fatal — removal proceeds even if the script fails.
+	if IsLinkedWorktree(worktreePath) {
+		_ = RunWorktreeDestructionBeforeRemove(repoDir, worktreePath, os.Stderr, os.Stderr, DefaultWorktreeDestructionTimeout)
+	}
+
 	args := []string{"-C", repoDir, "worktree", "remove"}
 	if force {
 		args = append(args, "--force")
@@ -831,7 +840,11 @@ func getDefaultRemote(repoDir string) (string, error) {
 		output, err := cmd.Output()
 		if err == nil {
 			remote := strings.TrimSpace(string(output))
-			if remote != "" {
+			// branch.<name>.remote may hold a bare URL (e.g. after pulling a
+			// PR branch directly from a fork URL). A URL is fetchable but is
+			// not a remote-tracking ref prefix, so "<url>/main" later fails
+			// with "invalid reference" — only accept configured remote names.
+			if remote != "" && slices.Contains(remotes, remote) {
 				return remote, nil
 			}
 		}
