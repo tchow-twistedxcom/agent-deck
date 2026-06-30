@@ -51,7 +51,7 @@ from main's checkout each run. Changes to them must be pushed to BOTH `custom/de
 `/.github/workflows/ci.yml` (fork-only) builds and tests pushes/PRs to `main`,
 `custom/dev`, and `feature/*`.
 
-## Patch inventory (as of v1.9.54 + 27)
+## Patch inventory (as of v1.10.7 + 2)
 
 Grouped by feature. "Upstream?" = candidate for submitting upstream; every patch
 upstreamed is permanent merge burden removed.
@@ -59,19 +59,26 @@ upstreamed is permanent merge burden removed.
 | Feature | Commits (representative) | Upstream? |
 |---------|--------------------------|-----------|
 | Happy wrapper for Claude/Codex sessions (incl. resume path) | `5b96d734`, `dfa3d5a6` | No, org-specific |
+| Block happy+chrome combo at creation/edit; strip --chrome from command build | `5fdce325` | No, org-specific (happy wrapper is org-specific) |
 | OAuth support for HTTP MCP servers | `efd4b6ae` | **Yes, strong candidate** |
 | Worktree: branch reuse + fzf picker, generated-name placeholder, parent-session symlink for resume | `ed917967`, `44f25141`, `f30747ce` | **Yes, strong candidate** |
 | Auto-generated session names as dialog placeholders | `ef84c4b3` | Yes |
 | Ctrl+Q detach / tmux keybinding behavior (C-q gate on socket isolation, no root binding, MakeRaw handling, extended-keys per-session, terminal-features dedup) | `37dedc9a`, `6bb20d54`, `dff4ba1a`, `6bd1ec93`, `7f8c524e`, `9744b76e`, `ce713a2e`, `fb6d29c5` | Partially; behavior preference, propose upstream as config flag |
 | Claude session ID validation (corruption guard) | `37a3f509` | Yes, check if upstream fixed independently |
 | Cost dashboard on C key, $ restored for error filter | `d9766925` | No, keybind preference |
-| `sort_by_actionable` off switch for in-group sort | `61e8857a` | Yes |
+| `sort_by_actionable` off switch (shim over upstream groupSortMode) | `61e8857a` | Absorbed: upstream added groupSortMode string; our SetSortByActionable is now a shim |
 | Clear stale `AGENTDECK_PROFILE` from tmux global env | `abb0f757` | Yes |
 | Fork validation helper (`sessionFileFoundButEmpty`) | `4642d8f8` | No, fork test support |
+| Termius emoji-wide row clamping (terminalDrawWidth) | `ba1b4243` | No, Termius-specific; upstream uses ansi.StringWidth |
 | Repo hygiene (.beads gitignore, fork CI files) | `5aa3b339`, `74e70078` | No, fork-only |
 
 Integration-noise commits (`95912e58`, `48cbeb04`, `a2a3e5b8`, `ca3b1bcd`) are
 leftovers from the rebase era; merge-based tracking stops producing these.
+
+Known new upstream test failures in this environment (not caused by fork patches):
+- `TestCanRestartCursor`: requires `cursor` binary, not present on this host.
+- `TestCtrlS_NewDialogOpen_DoesNotOpenSwitcher`: wiring for the new session-switcher
+  feature (#1411) interacts with the test harness in a way not yet diagnosed.
 
 When adding a new customization: add a row here in the same commit. When upstream
 absorbs a feature, delete the row and note the upstream PR.
@@ -91,3 +98,7 @@ agent-deck --version # must NOT say -dirty
 Pre-sync snapshots are kept as tags (`fork-backup/<version>`), not branches.
 Keep the last two; delete older ones. Merge-based tracking makes these mostly
 redundant (no history rewriting), they are cheap insurance only.
+
+Current tags: `fork-backup/v1.9.54` (pre-v1.10.7 merge), `fork-backup/pre-v1.9.54`.
+Older tags (`fork-backup/before-rebase-2026-03`, `fork-backup/origin-pre-v1.9.54-push`,
+`fork-backup/pre-v1.9.31`, `fork-backup/pre-v1.9.44`) can be deleted when convenient.
