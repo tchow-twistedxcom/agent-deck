@@ -68,6 +68,7 @@ func (d *EditSessionDialog) Show(inst *session.Instance) {
 	}
 	if session.IsClaudeCompatible(inst.Tool) {
 		skip, auto := readClaudeFlags(inst)
+		happy, chrome := readClaudeHappyChrome(inst)
 		d.fields = append(d.fields,
 			editField{key: session.FieldSkipPermissions,
 				label: "Skip permissions (restart, claude)", kind: editFieldCheckbox,
@@ -75,6 +76,12 @@ func (d *EditSessionDialog) Show(inst *session.Instance) {
 			editField{key: session.FieldAutoMode,
 				label: "Auto mode (restart, claude)", kind: editFieldCheckbox,
 				checked: auto},
+			editField{key: session.FieldUseHappy,
+				label: "Use happy wrapper (restart, claude)", kind: editFieldCheckbox,
+				checked: happy},
+			editField{key: session.FieldUseChrome,
+				label: "Use chrome (restart, claude; conflicts with happy)", kind: editFieldCheckbox,
+				checked: chrome},
 			editField{key: session.FieldExtraArgs,
 				label: "Extra args (restart, claude) — space-separated",
 				kind:  editFieldText,
@@ -112,6 +119,20 @@ func readClaudeFlags(inst *session.Instance) (skip, auto bool) {
 		return false, false
 	}
 	return cfg.Claude.GetDangerousMode(), cfg.Claude.AutoMode
+}
+
+// readClaudeHappyChrome returns the effective happy-wrapper / --chrome state,
+// mirroring readClaudeFlags' config fallback: empty ToolOptionsJSON means the
+// launcher reads from config.toml at start time, so the dialog must too.
+func readClaudeHappyChrome(inst *session.Instance) (happy, chrome bool) {
+	if opts, err := session.UnmarshalClaudeOptions(inst.ToolOptionsJSON); err == nil && opts != nil {
+		return opts.UseHappy, opts.UseChrome
+	}
+	cfg, _ := session.LoadUserConfig()
+	if cfg == nil {
+		return false, false
+	}
+	return cfg.Claude.UseHappy, cfg.Claude.UseChrome
 }
 
 // displayGroupName returns the human label for a group path. Mirrors
@@ -223,15 +244,34 @@ func (d *EditSessionDialog) HasRestartRequiredChanges(inst *session.Instance) bo
 // Validate is best-effort pre-flight feedback; SetField re-validates
 // authoritatively at commit time.
 func (d *EditSessionDialog) Validate() string {
+	var opts session.ClaudeOptions
+	var extraArgs []string
 	for _, f := range d.fields {
-		if f.kind != editFieldText {
-			continue
-		}
-		if f.key == session.FieldTitle {
-			if strings.TrimSpace(f.input.Value()) == "" {
-				return "Title cannot be empty"
+		switch f.kind {
+		case editFieldText:
+			switch f.key {
+			case session.FieldTitle:
+				if strings.TrimSpace(f.input.Value()) == "" {
+					return "Title cannot be empty"
+				}
+			case session.FieldExtraArgs:
+				extraArgs = strings.Fields(f.input.Value())
+			}
+		case editFieldCheckbox:
+			switch f.key {
+			case session.FieldUseHappy:
+				opts.UseHappy = f.checked
+			case session.FieldUseChrome:
+				opts.UseChrome = f.checked
 			}
 		}
+	}
+	// happy + --chrome crash on start (happy rejects --chrome). Block the
+	// intended final state here, before any per-field SetField runs. Covers
+	// both the Use-chrome checkbox and a --chrome token typed into extra args,
+	// matching NewDialog.Validate.
+	if session.ClaudeOptionsConflict(&opts, extraArgs) {
+		return session.ClaudeChromeWithHappyError
 	}
 	return ""
 }
@@ -254,6 +294,12 @@ func fieldInitialValue(inst *session.Instance, field string) string {
 	case session.FieldAutoMode:
 		_, auto := readClaudeFlags(inst)
 		return strconv.FormatBool(auto)
+	case session.FieldUseHappy:
+		happy, _ := readClaudeHappyChrome(inst)
+		return strconv.FormatBool(happy)
+	case session.FieldUseChrome:
+		_, chrome := readClaudeHappyChrome(inst)
+		return strconv.FormatBool(chrome)
 	}
 	return ""
 }

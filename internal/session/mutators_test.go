@@ -338,6 +338,48 @@ func TestSetField_AutoMode_PreservesSkipPermissions(t *testing.T) {
 	}
 }
 
+// use-happy / use-chrome are editable claude option flags so a session stuck
+// in the happy+--chrome crash loop can be repaired from the Edit dialog (and
+// `agent-deck session set`) without recreating it. This test pins the
+// round-trip: flip happy on, then back off, leaving chrome intact.
+func TestSetField_UseHappy_UseChrome_RoundTrip(t *testing.T) {
+	inst := &Instance{Tool: "claude"}
+	if _, _, err := SetField(inst, FieldUseChrome, "true", nil); err != nil {
+		t.Fatalf("SetField(use-chrome=true) failed: %v", err)
+	}
+	if _, _, err := SetField(inst, FieldUseHappy, "true", nil); err != nil {
+		t.Fatalf("SetField(use-happy=true) failed: %v", err)
+	}
+	opts, _ := UnmarshalClaudeOptions(inst.ToolOptionsJSON)
+	if opts == nil || !opts.UseHappy || !opts.UseChrome {
+		t.Fatalf("expected happy=true and chrome=true after edits; got %+v", opts)
+	}
+
+	// Repair: turn happy back off; chrome must survive (the keep-chrome path).
+	if _, _, err := SetField(inst, FieldUseHappy, "false", nil); err != nil {
+		t.Fatalf("SetField(use-happy=false) failed: %v", err)
+	}
+	opts, _ = UnmarshalClaudeOptions(inst.ToolOptionsJSON)
+	if opts == nil || opts.UseHappy || !opts.UseChrome {
+		t.Fatalf("expected happy=false and chrome=true after repair; got %+v", opts)
+	}
+}
+
+// use-happy / use-chrome require a restart to take effect (they change the
+// launch command) and are claude-only.
+func TestSetField_UseHappy_RestartRequiredAndClaudeOnly(t *testing.T) {
+	if RestartPolicyFor(FieldUseHappy) != FieldRestartRequired {
+		t.Error("use-happy must be restart-required")
+	}
+	if RestartPolicyFor(FieldUseChrome) != FieldRestartRequired {
+		t.Error("use-chrome must be restart-required")
+	}
+	inst := &Instance{Tool: "shell"}
+	if _, _, err := SetField(inst, FieldUseHappy, "true", nil); err == nil {
+		t.Fatal("expected error setting use-happy on non-claude session")
+	}
+}
+
 // Skip/auto only make sense on claude-compatible tools; SetField must
 // reject them on shell/gemini sessions instead of silently encoding flags
 // that the launcher would never emit.

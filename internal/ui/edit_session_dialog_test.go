@@ -21,6 +21,57 @@ func sampleInstance() *session.Instance {
 	}
 }
 
+// The Edit dialog now exposes Use-happy / Use-chrome checkboxes so a session
+// stuck in the happy+--chrome crash loop can be repaired. Validate must reject
+// the intended final state where both are on (happy rejects --chrome on start).
+func TestEditSessionDialog_Validate_RejectsHappyPlusChrome(t *testing.T) {
+	d := NewEditSessionDialog()
+	d.SetSize(100, 40)
+	d.Show(&session.Instance{ID: "sess-hc", Title: "hc", Tool: "claude"})
+
+	setCheckbox := func(key string, v bool) {
+		for i := range d.fields {
+			if d.fields[i].key == key {
+				d.fields[i].checked = v
+				return
+			}
+		}
+		t.Fatalf("checkbox %q not found in dialog fields", key)
+	}
+
+	setCheckbox(session.FieldUseHappy, true)
+	setCheckbox(session.FieldUseChrome, true)
+	if msg := d.Validate(); msg == "" {
+		t.Fatal("expected validation error for happy+chrome combo, got none")
+	}
+
+	// Disabling chrome (the keep-happy fix) resolves the conflict.
+	setCheckbox(session.FieldUseChrome, false)
+	if msg := d.Validate(); msg != "" {
+		t.Fatalf("expected no error after disabling chrome; got %q", msg)
+	}
+
+	// Disabling happy instead (the keep-chrome fix) also resolves it.
+	setCheckbox(session.FieldUseChrome, true)
+	setCheckbox(session.FieldUseHappy, false)
+	if msg := d.Validate(); msg != "" {
+		t.Fatalf("expected no error after disabling happy; got %q", msg)
+	}
+
+	// A --chrome token typed into extra args also conflicts with happy, even
+	// when the Use-chrome checkbox is off (matches NewDialog.Validate).
+	setCheckbox(session.FieldUseChrome, false)
+	setCheckbox(session.FieldUseHappy, true)
+	for i := range d.fields {
+		if d.fields[i].key == session.FieldExtraArgs {
+			d.fields[i].input.SetValue("--verbose --chrome")
+		}
+	}
+	if msg := d.Validate(); msg == "" {
+		t.Fatal("expected validation error for happy + --chrome in extra args, got none")
+	}
+}
+
 func TestEditSessionDialog_InitiallyHidden(t *testing.T) {
 	d := NewEditSessionDialog()
 	if d == nil {

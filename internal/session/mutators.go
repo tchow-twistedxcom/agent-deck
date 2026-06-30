@@ -32,6 +32,8 @@ const (
 	FieldNoTransitionNotify = "no-transition-notify"
 	FieldSkipPermissions    = "skip-permissions"
 	FieldAutoMode           = "auto-mode"
+	FieldUseHappy           = "use-happy"    // launch claude via the happy wrapper
+	FieldUseChrome          = "use-chrome"   // add --chrome (incompatible with use-happy)
 	FieldAccount            = "account"      // #924 per-session named account slot
 	FieldIdleTimeout        = "idle-timeout" // #1143 auto-stop dormant sessions
 )
@@ -55,6 +57,8 @@ var ValidMutableFields = []string{
 	FieldNoTransitionNotify,
 	FieldSkipPermissions,
 	FieldAutoMode,
+	FieldUseHappy,
+	FieldUseChrome,
 	FieldAccount,
 	FieldIdleTimeout,
 }
@@ -69,7 +73,7 @@ const (
 func RestartPolicyFor(field string) FieldRestartPolicy {
 	switch field {
 	case FieldCommand, FieldWrapper, FieldTool, FieldChannels, FieldPlugins, FieldExtraArgs, FieldPath,
-		FieldSkipPermissions, FieldAutoMode, FieldAccount:
+		FieldSkipPermissions, FieldAutoMode, FieldUseHappy, FieldUseChrome, FieldAccount:
 		return FieldRestartRequired
 	default:
 		return FieldLive
@@ -332,6 +336,22 @@ func SetField(inst *Instance, field, value string, extraArgsTokens []string) (ol
 		oldValue, err = setClaudeOptionBool(inst, field, value,
 			func(o *ClaudeOptions) bool { return o.AutoMode },
 			func(o *ClaudeOptions, b bool) { o.AutoMode = b })
+		if err != nil {
+			return oldValue, nil, err
+		}
+
+	case FieldUseHappy:
+		oldValue, err = setClaudeOptionBool(inst, field, value,
+			func(o *ClaudeOptions) bool { return o.UseHappy },
+			func(o *ClaudeOptions, b bool) { o.UseHappy = b })
+		if err != nil {
+			return oldValue, nil, err
+		}
+
+	case FieldUseChrome:
+		oldValue, err = setClaudeOptionBool(inst, field, value,
+			func(o *ClaudeOptions) bool { return o.UseChrome },
+			func(o *ClaudeOptions, b bool) { o.UseChrome = b })
 		if err != nil {
 			return oldValue, nil, err
 		}

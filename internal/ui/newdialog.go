@@ -1353,6 +1353,13 @@ func (d *NewDialog) Validate() string {
 		}
 	}
 
+	// happy + --chrome crash on start (happy rejects --chrome). Catch the
+	// combo here so the broken session is never created — covers both the
+	// Use-chrome checkbox and a --chrome token typed into extra args.
+	if d.isClaudeSelected() && session.ClaudeOptionsConflict(d.GetClaudeOptions(), d.GetClaudeExtraArgs()) {
+		return session.ClaudeChromeWithHappyError
+	}
+
 	return "" // Valid
 }
 

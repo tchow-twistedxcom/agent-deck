@@ -1044,12 +1044,28 @@ func (i *Instance) buildClaudeExtraFlags(opts *ClaudeOptions) string {
 			flags = append(flags, "--allow-dangerously-skip-permissions")
 		}
 		if opts.UseChrome {
-			flags = append(flags, "--chrome")
+			// happy (happy-coder) rejects --chrome with "unknown option
+			// '--chrome'" and the session dies on start. Validation blocks the
+			// combo at creation/edit time, but legacy/CLI/migrated sessions can
+			// still carry both — drop --chrome here so happy launches instead of
+			// crash-looping. See ClaudeChromeWithHappyError.
+			if opts.UseHappy {
+				slog.Warn("dropping --chrome: happy wrapper does not support it",
+					slog.String("component", "session"),
+					slog.String("instance_id", i.ID))
+			} else {
+				flags = append(flags, "--chrome")
+			}
 		}
 		if opts.UseTeammateMode {
 			flags = append(flags, "--teammate-mode tmux")
 		}
 	}
+
+	// dropChrome mirrors the option-flag guard above for user-supplied extra
+	// args: the config.toml [claude] extra_args default is ["--chrome"], so a
+	// happy session can carry --chrome here even when UseChrome is false.
+	dropChrome := opts != nil && opts.UseHappy
 
 	// Plugin channels: subscribe the claude session to inbound messages from
 	// each listed plugin channel. Persisted on Instance.Channels and refreshed
@@ -1063,6 +1079,12 @@ func (i *Instance) buildClaudeExtraFlags(opts *ClaudeOptions) string {
 	// without being re-tokenized. Appended last so user flags can override
 	// defaults claude accepts in last-wins ordering.
 	for _, tok := range i.ExtraArgs {
+		if dropChrome && tok == "--chrome" {
+			slog.Warn("dropping --chrome from extra args: happy wrapper does not support it",
+				slog.String("component", "session"),
+				slog.String("instance_id", i.ID))
+			continue
+		}
 		flags = append(flags, shellescape.Quote(tok))
 	}
 

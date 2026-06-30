@@ -47,6 +47,36 @@ type ClaudeOptions struct {
 	WorktreeBranch   string `json:"-"`
 }
 
+// ClaudeChromeWithHappyError is the user-facing message for the one launch
+// combination that cannot work: the happy wrapper plus --chrome. happy
+// (happy-coder) re-parses Claude's flags through its own commander layer and
+// rejects --chrome with `error: unknown option '--chrome'`, so the wrapped
+// claude never starts and the tmux pane dies on launch (session goes straight
+// to "error"). Keep the two mutually exclusive at every creation/edit entry
+// point; the command builder also strips --chrome when happy as a last-resort
+// safety net (see Instance.buildClaudeExtraFlags).
+const ClaudeChromeWithHappyError = "the happy wrapper cannot be combined with --chrome (happy rejects it with \"unknown option '--chrome'\" and the session fails to start); enable only one of \"Use happy wrapper\" or \"Use chrome\""
+
+// ClaudeOptionsConflict reports whether opts + extraArgs form the happy+--chrome
+// combination that crashes on start. extraArgs is the instance's verbatim claude
+// CLI tokens, which can carry --chrome independently of UseChrome (e.g. via the
+// config.toml [claude] extra_args default). Returns false for nil opts or any
+// configuration that does not use the happy wrapper.
+func ClaudeOptionsConflict(opts *ClaudeOptions, extraArgs []string) bool {
+	if opts == nil || !opts.UseHappy {
+		return false
+	}
+	if opts.UseChrome {
+		return true
+	}
+	for _, a := range extraArgs {
+		if a == "--chrome" {
+			return true
+		}
+	}
+	return false
+}
+
 // ToolName returns "claude"
 func (o *ClaudeOptions) ToolName() string {
 	return "claude"
