@@ -1,0 +1,39 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Bash(git --version)",
+      "Bash(git config:*)",
+      "Bash(ssh:*)",
+      "mcp__context7__resolve-library-id",
+      "mcp__context7__get-library-docs",
+      "Bash(chmod:*)",
+      "Bash(codex login:*)",
+      "mcp__codex__codex",
+      "Bash(docker-compose:*)",
+      "Bash(docker compose:*)",
+      "Bash(curl:*)",
+      "Bash(bash:*)",
+      "Bash(CLAUDE_COMPLETED_TASKS=3 CLAUDE_TASK_SUMMARY=\"Successfully implemented Claude Code hooks with ntfy integration\" bash ~/.config/claude-code/hooks/on-complete.sh)",
+      "WebSearch",
+      "Bash(node:*)",
+      "Bash(find:*)",
+      "Bash(docker cp:*)",
+      "Bash(docker logs:*)",
+      "Bash(ufw status:*)",
+      "Bash(ss:*)",
+      "Bash(sudo ufw:*)",
+      "Bash(wget:*)",
+      "Bash(ping:*)",
+      "Bash(nc:*)",
+      "Bash(tailscale:*)"
+    ],
+    "deny": [],
+    "ask": []
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "portainer",
+    "slack"
+  ]
+}
