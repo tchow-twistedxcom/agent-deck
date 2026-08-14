@@ -25,6 +25,9 @@ func (e *envVarFlags) Set(val string) error {
 	if len(parts) != 2 || parts[0] == "" {
 		return fmt.Errorf("invalid env format %q, expected KEY=VALUE", val)
 	}
+	if !session.IsValidEnvKey(parts[0]) {
+		return fmt.Errorf("invalid environment variable name %q", parts[0])
+	}
 	(*e)[parts[0]] = parts[1]
 	return nil
 }
@@ -236,7 +239,18 @@ func handleConductorSetup(profile string, args []string) {
 		fmt.Fprintln(os.Stderr, "Error: -claude-md and -shared-claude-md are only valid with --agent=claude")
 		os.Exit(1)
 	}
-	resolvedProfile := session.GetEffectiveProfile(profile)
+	// #1790/#1822 F2: route through the guarded resolver, not a bare
+	// GetEffectiveProfile — this value goes on to SetupConductorWithAgent
+	// and NewStorageWithProfile below, both of which create on-disk state.
+	// A bare GetEffectiveProfile would let a CLAUDE_CONFIG_DIR-inferred name
+	// that doesn't match an existing profile look like an explicit -p
+	// selection once resolved here, bypassing the #1790 guard a second hop
+	// downstream.
+	resolvedProfile, err := session.ResolveProfileForStorage(profile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: failed to resolve profile: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Auto-migrate legacy conductors
 	runAutoMigration(*jsonOutput)
@@ -850,23 +864,33 @@ func handleConductorTeardown(_ string, args []string) {
 				fmt.Printf("  [ok] Removed directory for %s\n", meta.Name)
 			}
 
-			// Remove session from storage
+			// Remove session from storage. #1550: SaveWithGroups is upsert-only
+			// (saving a filtered list no longer drops the missing rows), so
+			// removal goes through the targeted verify path (#909).
 			if storage != nil {
 				instances, groups, err := storage.LoadWithGroups()
 				if err == nil {
 					var filtered []*session.Instance
-					sessionRemoved := false
+					var removedIDs []string
 					for _, inst := range instances {
 						if inst.Title == sessionTitle {
-							sessionRemoved = true
+							removedIDs = append(removedIDs, inst.ID)
 							continue
 						}
 						filtered = append(filtered, inst)
 					}
-					if sessionRemoved {
+					if len(removedIDs) > 0 {
 						groupTree := session.NewGroupTreeWithGroups(filtered, groups)
-						_ = storage.SaveWithGroups(filtered, groupTree)
-						if !*jsonOutput {
+						removeFailed := false
+						for _, id := range removedIDs {
+							if rmErr := storage.RemoveSessionAndVerify(id, filtered, groupTree); rmErr != nil {
+								removeFailed = true
+								if !*jsonOutput {
+									fmt.Fprintf(os.Stderr, "  Warning: failed to remove session '%s' (%s) from %s: %v\n", sessionTitle, id, meta.Profile, rmErr)
+								}
+							}
+						}
+						if !removeFailed && !*jsonOutput {
 							fmt.Printf("  [ok] Removed session '%s' from %s\n", sessionTitle, meta.Profile)
 						}
 					}

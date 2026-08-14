@@ -15,6 +15,13 @@ import (
 // accounts should treat this as non-fatal: there is simply nothing to migrate.
 var ErrNoConversation = errors.New("no conversation file found")
 
+// ErrAmbiguousConversation reports that the source project dir holds several
+// conversations while the instance has no id that resolves to one of them, so
+// no transcript can be attributed to it (#1815). Distinct from
+// ErrNoConversation: something IS there, it just cannot be shown to be this
+// session's, and copying a guess across accounts is not acceptable.
+var ErrAmbiguousConversation = errors.New("conversation cannot be attributed to this session")
+
 // MigrateConversation copies the session's Claude conversation file from its
 // currently resolved config dir into targetConfigDir, so `claude --resume`
 // finds the history after an account switch (#924 follow-up). Copy-only: the
@@ -52,7 +59,7 @@ func MigrateConversationFrom(inst *Instance, srcConfigDir, targetConfigDir strin
 	if src == "" || dst == "" {
 		return "", fmt.Errorf("source and target config dirs must be non-empty")
 	}
-	if filepath.Clean(src) == filepath.Clean(dst) {
+	if filepath.Clean(src) == filepath.Clean(dst) || resolveRealPath(src) == resolveRealPath(dst) {
 		return "", nil
 	}
 
@@ -73,8 +80,25 @@ func MigrateConversationFrom(inst *Instance, srcConfigDir, targetConfigDir strin
 		if newestFile == "" {
 			return "", fmt.Errorf("%w under %s", ErrNoConversation, srcProjDir)
 		}
+		// #1815: "newest conversation in the project dir" is a guess, and it
+		// is a guess whether or not an older id was stored — the fallback is
+		// choosing a DIFFERENT conversation by mtime either way, so a stale
+		// stored id does not make the replacement owned.
+		//
+		// Where the guess is AMBIGUOUS (more than one conversation in the
+		// directory, i.e. sessions share this cwd) it is refused outright
+		// rather than copied: copying first and refusing to resume later has
+		// already carried a neighbouring session's conversation into another
+		// account's config dir. Where the directory holds exactly one
+		// conversation there is nothing to confuse it with, so the repair the
+		// fallback exists for still works — but the id stays suspect until
+		// something vouches for it, so it cannot authorize a `--resume`.
+		if conversationCount(srcProjDir) > 1 {
+			return "", fmt.Errorf("%w: %s holds several conversations and %s has no resolvable id of its own, so the newest one cannot be attributed to it",
+				ErrAmbiguousConversation, srcProjDir, inst.Title)
+		}
 		srcFile, sid = newestFile, newestID
-		inst.ClaudeSessionID = newestID
+		inst.adoptDiscoveredClaudeSessionID(newestID)
 	}
 
 	dstProjDir := filepath.Join(dst, "projects", projDirName)
@@ -82,17 +106,122 @@ func MigrateConversationFrom(inst *Instance, srcConfigDir, targetConfigDir strin
 		return "", fmt.Errorf("create target project dir: %w", err)
 	}
 	dstFile := filepath.Join(dstProjDir, sid+".jsonl")
+	bak := ""
 	if fileIsRegular(dstFile) {
 		// Backup before any destructive write (2026-06-04 incident, S2).
-		bak := fmt.Sprintf("%s.bak-%d", dstFile, time.Now().Unix())
+		bak = fmt.Sprintf("%s.bak-%d", dstFile, time.Now().Unix())
 		if err := os.Rename(dstFile, bak); err != nil {
 			return "", fmt.Errorf("backup existing conversation: %w", err)
 		}
 	}
 	if err := copyFileVerified(srcFile, dstFile); err != nil {
+		if bak != "" {
+			_ = os.Remove(dstFile)
+			if restoreErr := os.Rename(bak, dstFile); restoreErr != nil {
+				return "", fmt.Errorf("%w (restore backup failed: %v)", err, restoreErr)
+			}
+		}
 		return "", err
 	}
+
+	// Migrate the companion subagent directory (#1571): subagent transcripts
+	// live in projects/<encoded-path>/<sid>/ next to the jsonl. Resume works
+	// without it, but leaving it behind silently loses those transcripts.
+	// Copy-only, per-file size-verified; failure aborts before the caller
+	// flips the account field (the already-copied jsonl is harmless and a
+	// rerun is idempotent).
+	srcSubagentDir := filepath.Join(srcProjDir, sid)
+	if info, err := os.Stat(srcSubagentDir); err == nil && info.IsDir() {
+		if err := copyDirVerified(srcSubagentDir, filepath.Join(dstProjDir, sid)); err != nil {
+			return "", fmt.Errorf("copy subagent dir: %w", err)
+		}
+	}
 	return dstFile, nil
+}
+
+// copyDirVerified recursively copies the regular files under src into dst
+// (created 0700), size-verifying each copy. Symlinks and other special files
+// are skipped.
+func copyDirVerified(src, dst string) error {
+	return filepath.WalkDir(src, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o700)
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		return copyFileVerified(path, target)
+	})
+}
+
+// RestoreOrphanedConversationBackup restores a conversation whose live
+// <id>.jsonl went missing but whose most recent <id>.jsonl.bak-<epoch>
+// orphan still exists in the project dir (the #1533 data-loss residue).
+// It is a no-op when a live <id>.jsonl is already present, when inst has
+// no ClaudeSessionID, or when no matching .bak- orphan exists. Returns the
+// restored path (or "" for no-op) and any error.
+func RestoreOrphanedConversationBackup(inst *Instance, configDir string) (string, error) {
+	if inst == nil || inst.Tool != "claude" || inst.ClaudeSessionID == "" || strings.TrimSpace(configDir) == "" {
+		return "", nil
+	}
+
+	cfgDir := ExpandPath(strings.TrimSpace(configDir))
+	projectPath := inst.EffectiveWorkingDir()
+	resolvedPath := projectPath
+	if resolved, err := filepath.EvalSymlinks(projectPath); err == nil {
+		resolvedPath = resolved
+	}
+	encodedPath := ConvertToClaudeDirName(resolvedPath)
+	if encodedPath == "" {
+		encodedPath = "-"
+	}
+	projDir := filepath.Join(cfgDir, "projects", encodedPath)
+	live := filepath.Join(projDir, inst.ClaudeSessionID+".jsonl")
+	if fileIsRegular(live) {
+		return "", nil
+	}
+
+	bak, err := newestConversationBackup(projDir, inst.ClaudeSessionID)
+	if err != nil {
+		return "", err
+	}
+	if bak == "" {
+		return "", nil
+	}
+	if err := os.Rename(bak, live); err == nil {
+		return live, nil
+	}
+	if err := copyFileVerified(bak, live); err != nil {
+		return "", err
+	}
+	return live, nil
+}
+
+// conversationCount reports how many UUID-named conversation files live in
+// projDir. More than one means the directory is shared, so "the newest one"
+// identifies nothing (#1815).
+func conversationCount(projDir string) int {
+	files, err := filepath.Glob(filepath.Join(projDir, "*.jsonl"))
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, file := range files {
+		base := filepath.Base(file)
+		if strings.HasPrefix(base, "agent-") || !uuidSessionFileRegex.MatchString(base) {
+			continue
+		}
+		n++
+	}
+	return n
 }
 
 // newestConversationFile returns the most recently modified UUID-named
@@ -121,6 +250,26 @@ func newestConversationFile(projDir string) (path, sessionID string) {
 		}
 	}
 	return path, sessionID
+}
+
+func newestConversationBackup(projDir, sessionID string) (string, error) {
+	files, err := filepath.Glob(filepath.Join(projDir, sessionID+".jsonl.bak-*"))
+	if err != nil {
+		return "", fmt.Errorf("glob orphaned conversation backups: %w", err)
+	}
+	var newest string
+	var newestMod time.Time
+	for _, file := range files {
+		info, err := os.Stat(file)
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		if newest == "" || info.ModTime().After(newestMod) {
+			newest = file
+			newestMod = info.ModTime()
+		}
+	}
+	return newest, nil
 }
 
 // copyFileVerified copies src to dst (0600, matching Claude's conversation

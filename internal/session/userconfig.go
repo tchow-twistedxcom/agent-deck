@@ -21,6 +21,7 @@ import (
 
 	"github.com/asheshgoplani/agent-deck/internal/agentpaths"
 	"github.com/asheshgoplani/agent-deck/internal/atomicfile"
+	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/platform"
 	"github.com/asheshgoplani/agent-deck/internal/safeio"
@@ -142,6 +143,9 @@ type UserConfig struct {
 	// Codex defines Codex CLI integration settings
 	Codex CodexSettings `toml:"codex,omitempty"`
 
+	// Cursor defines Cursor Agent CLI integration settings (Issue #1672)
+	Cursor CursorSettings `toml:"cursor,omitempty"`
+
 	// Copilot defines GitHub Copilot CLI integration settings (Issue #556)
 	Copilot CopilotSettings `toml:"copilot,omitempty"`
 
@@ -217,6 +221,11 @@ type UserConfig struct {
 	// Watcher defines event watcher settings
 	Watcher WatcherSettings `toml:"watcher,omitempty"`
 
+	// IntervalHooks defines shell commands run on a wall-clock interval while
+	// the TUI is running, independent of session activity. Keyed by a
+	// user-chosen name (used in logs). See IntervalHookSettings.
+	IntervalHooks map[string]IntervalHookSettings `toml:"interval_hooks,omitempty"`
+
 	// Feedback defines in-product feedback prompt settings (v1.7.38+).
 	// Mirrors the opt-out in ~/.agent-deck/feedback-state.json so it is visible
 	// to the user and editable without running `agent-deck feedback`.
@@ -237,6 +246,9 @@ type UserConfig struct {
 	// Stage 1 (v1.9.67) is observe-only: it logs what it WOULD do, takes no
 	// action. See SelfHealSettings.
 	SelfHeal SelfHealSettings `toml:"selfheal,omitempty"`
+
+	// Performance holds opt-in resource tuning for multi-instance setups.
+	Performance PerformanceSettings `toml:"performance,omitempty"`
 }
 
 // SelfHealSettings controls the self-heal supervision policy (SELF-HEAL-DESIGN.md
@@ -316,6 +328,27 @@ func (s SelfHealSettings) IsSessionOptedOut(id, title string) bool {
 	return false
 }
 
+// PerformanceSettings tunes background-work sharing between concurrent
+// agent-deck instances.
+type PerformanceSettings struct {
+	// ClaimPolling enables per-session ownership claims in state.db: each
+	// session is actively polled by exactly one instance; others render its
+	// status from the DB. Default false (every instance polls everything,
+	// today's behavior).
+	//
+	//	[performance]
+	//	claim_polling = true
+	ClaimPolling *bool `toml:"claim_polling,omitempty"`
+}
+
+// ClaimPollingEnabled reports whether claim-based polling is enabled.
+func (c *UserConfig) ClaimPollingEnabled() bool {
+	if c == nil || c.Performance.ClaimPolling == nil {
+		return false
+	}
+	return *c.Performance.ClaimPolling
+}
+
 // UISettings controls TUI layout proportions.
 // See issue #1092.
 type UISettings struct {
@@ -325,11 +358,26 @@ type UISettings struct {
 	// Adjustable at runtime via < and > keybindings (5% step).
 	PreviewPct int `toml:"preview_pct,omitzero"`
 
+	// PreviewOrientation controls where the PREVIEW pane sits relative to
+	// the SESSIONS list on wide terminals (>= 80 cols). "right" (default)
+	// keeps the historical side-by-side split; "below" stacks PREVIEW under
+	// SESSIONS (useful on tall/portrait monitors). Narrow terminals always
+	// stack regardless. Toggle at runtime with the `O` keybinding.
+	PreviewOrientation string `toml:"preview_orientation,omitempty"`
+
 	// ITermOpenAs controls whether Shift+Enter pops the focused session
 	// into a new iTerm2 *tab* or a new iTerm2 *window* on macOS. Valid
 	// values: "tab", "window". Empty defaults to "tab" (iTerm's natural
 	// UX). Issue #1100, follow-up to #1098 — credit @ddorman-dn.
 	ITermOpenAs string `toml:"iterm_open_as,omitempty"`
+	// ShellSplit controls the terminal used by the open_shell_here hotkey.
+	// Valid values:
+	//   "iterm"  — always open an iTerm2 vertical split pane (macOS only)
+	//   "tmux"   — always open a new tmux window
+	//   ""       — auto: use iTerm2 split when LC_TERMINAL=iTerm2 or
+	//              TERM_PROGRAM=iTerm.app, otherwise tmux
+	// Default: "" (auto). Issue #1470.
+	ShellSplit string `toml:"shell_split,omitempty"`
 	// RemoteLatencyRefreshSecs sets how often the TUI re-measures the
 	// round-trip latency to each configured remote (issue #1103). Valid
 	// range: 2-300. Default: matches [system_stats].refresh_seconds (5s)
@@ -383,6 +431,15 @@ type UISettings struct {
 	// (`new_session_enter_advances = false` → restores the legacy Enter-submits
 	// behavior). Set `= true` (or leave unset) to keep the new default.
 	NewSessionEnterAdvances *bool `toml:"new_session_enter_advances"`
+
+	// AttachOnCreate controls whether creating a session in the TUI (the `n`
+	// new-session dialog) immediately attaches to the new session's pane
+	// instead of only moving the cursor to it. Default false: creating a
+	// session selects it (today's behavior) and the user presses Enter to
+	// attach. Set `= true` to "instantly open" each new session. CLI
+	// `add`/`session start` are unaffected by this flag — they attach only
+	// with an explicit `--attach`.
+	AttachOnCreate bool `toml:"attach_on_create,omitempty"`
 }
 
 // normalizeUIHiddenTools lowercases, dedupes, and drops unknown entries from
@@ -441,6 +498,21 @@ const (
 	ITermOpenAsTab     = "tab"
 	ITermOpenAsWindow  = "window"
 	DefaultITermOpenAs = ITermOpenAsTab
+)
+
+// ShellSplit modes for the open_shell_here hotkey (issue #1470).
+const (
+	ShellSplitITerm = "iterm"
+	ShellSplitTmux  = "tmux"
+)
+
+// Preview-pane orientation modes for wide terminals (>= 80 cols).
+// "right" is the historical side-by-side split; "below" stacks the
+// PREVIEW pane under the SESSIONS list (portrait-monitor friendly).
+const (
+	PreviewOrientationRight   = "right"
+	PreviewOrientationBelow   = "below"
+	DefaultPreviewOrientation = PreviewOrientationRight
 )
 
 // Footer hint-bar styles. See UISettings.Footer.
@@ -502,6 +574,32 @@ func (u UISettings) GetITermOpenAs() string {
 	return DefaultITermOpenAs
 }
 
+// GetShellSplit returns the configured shell-split mode. Unknown or empty
+// values return "" (auto-detect). Matching is case-insensitive.
+func (u UISettings) GetShellSplit() string {
+	switch strings.ToLower(strings.TrimSpace(u.ShellSplit)) {
+	case ShellSplitITerm:
+		return ShellSplitITerm
+	case ShellSplitTmux:
+		return ShellSplitTmux
+	}
+	return ""
+}
+
+// GetPreviewOrientation returns the configured preview-pane orientation
+// for wide terminals. Unknown or empty values fall through to the default
+// ("right"). Matching is case-insensitive so users can write "Below" or
+// "RIGHT" in TOML.
+func (u UISettings) GetPreviewOrientation() string {
+	switch strings.ToLower(strings.TrimSpace(u.PreviewOrientation)) {
+	case PreviewOrientationBelow:
+		return PreviewOrientationBelow
+	case PreviewOrientationRight:
+		return PreviewOrientationRight
+	}
+	return DefaultPreviewOrientation
+}
+
 // Remote session-list poll cadence bounds (issue #1170). The default is
 // deliberately tighter than the historical hardcoded 30s so new remote
 // sessions surface promptly; the min keeps a floor on SSH frequency.
@@ -542,6 +640,12 @@ func (u UISettings) GetNewSessionEnterAdvances() bool {
 	return *u.NewSessionEnterAdvances
 }
 
+// GetAttachOnCreate reports whether the TUI should attach to a newly created
+// session immediately instead of only selecting it. Default false.
+func (u UISettings) GetAttachOnCreate() bool {
+	return u.AttachOnCreate
+}
+
 // GetRemoteLatencyRefreshSecs returns the remote latency refresh interval
 // in seconds, clamped to [2, 300]. When the user has not set this value
 // it falls back to fallbackSecs (typically the system_stats refresh
@@ -566,6 +670,19 @@ type WebSettings struct {
 	// MutationsEnabled controls whether POST/PATCH/DELETE endpoints accept
 	// requests. nil (omitted) defaults to true. Forced off by --read-only.
 	MutationsEnabled *bool `toml:"mutations_enabled,omitempty"`
+
+	// TrustedDomains lists hosts whose links open from the web terminal
+	// without the "this link could potentially be dangerous" confirm
+	// (issue #1682). Entries are hosts, not URLs — a full URL is accepted
+	// and reduced to its host. A leading `*.` matches subdomains only
+	// (`*.corp.example` matches `git.corp.example`, not `corp.example`).
+	// Everything not on the list still confirms.
+	TrustedDomains []string `toml:"trusted_domains,omitempty"`
+
+	// ConfirmLinkOpen controls the web terminal's link-open confirm for
+	// hosts that are NOT on TrustedDomains. nil (omitted) defaults to true.
+	// Setting it false accepts the risk and opens every link directly.
+	ConfirmLinkOpen *bool `toml:"confirm_link_open,omitempty"`
 }
 
 // FeedbackSettings controls the in-product feedback prompts.
@@ -703,12 +820,16 @@ type GroupClaudeSettings struct {
 	Env map[string]string `toml:"env,omitempty"`
 
 	// Skills lists declarative skill-loadout entries ("<source>/<name>")
-	// to attach to sessions in this group. Reserved schema home for the
-	// loadout follow-up; surfaced by `group show --resolved`.
+	// attached to sessions in this group at create and re-asserted on
+	// every start (ApplyConfiguredLoadout — attach-only floor semantics).
 	Skills []string `toml:"skills,omitempty"`
 
-	// MCPs lists [mcps.X] catalog names to attach to sessions in this
-	// group. Reserved schema home for the loadout follow-up.
+	// Plugins lists [plugins.X] catalog keys unioned into Instance.Plugins.
+	// Catalog resolution remains the single plugin enablement path.
+	Plugins []string `toml:"plugins,omitempty"`
+
+	// MCPs lists [mcps.X] catalog names appended to the local .mcp.json
+	// of sessions in this group. Same floor semantics as Skills.
 	MCPs []string `toml:"mcps,omitempty"`
 }
 
@@ -762,12 +883,15 @@ type ConductorClaudeSettings struct {
 	// AFTER the group env map (conductor wins per key on conflict).
 	Env map[string]string `toml:"env,omitempty"`
 
-	// Skills lists declarative skill-loadout entries ("<source>/<name>").
-	// Reserved schema home for the loadout follow-up.
+	// Skills lists declarative skill-loadout entries ("<source>/<name>")
+	// unioned on top of the group floor for this conductor's sessions.
 	Skills []string `toml:"skills,omitempty"`
 
-	// MCPs lists [mcps.X] catalog names. Reserved schema home for the
-	// loadout follow-up.
+	// Plugins lists [plugins.X] catalog keys unioned on top of the group floor.
+	Plugins []string `toml:"plugins,omitempty"`
+
+	// MCPs lists [mcps.X] catalog names unioned on top of the group
+	// floor. Same semantics as Skills.
 	MCPs []string `toml:"mcps,omitempty"`
 }
 
@@ -1445,9 +1569,15 @@ func (c *UserConfig) GetGroupClaudeSkills(groupPath string) []string {
 	return c.unionGroupClaudeList(groupPath, func(s GroupClaudeSettings) []string { return s.Skills })
 }
 
+// GetGroupClaudePlugins returns the union of catalog plugin keys along the
+// group ancestor chain, deduplicated and root-first.
+func (c *UserConfig) GetGroupClaudePlugins(groupPath string) []string {
+	return c.unionGroupClaudeList(groupPath, func(s GroupClaudeSettings) []string { return s.Plugins })
+}
+
 // GetGroupClaudeMCPs returns the union of [mcps.X] catalog names along the
 // group ancestor chain, deduplicated, root-first. Same floor semantics as
-// GetGroupClaudeSkills.
+// GetGroupClaudePlugins.
 func (c *UserConfig) GetGroupClaudeMCPs(groupPath string) []string {
 	return c.unionGroupClaudeList(groupPath, func(s GroupClaudeSettings) []string { return s.MCPs })
 }
@@ -1579,12 +1709,21 @@ func (c *UserConfig) GetConductorClaudeSkills(name string) []string {
 		return nil
 	}
 	// Defensive copy — see GetConductorClaudeEnv. Callers must not mutate the
-	// cached slice; GetGroupClaudeSkills likewise returns a fresh union slice.
+	// cached slice; the group skill getter likewise returns a fresh union slice.
+	return append([]string(nil), src...)
+}
+
+// GetConductorClaudePlugins returns conductor-specific catalog plugin keys.
+func (c *UserConfig) GetConductorClaudePlugins(name string) []string {
+	if c == nil || name == "" || c.Conductors == nil {
+		return nil
+	}
+	src := c.Conductors[name].Claude.Plugins
 	return append([]string(nil), src...)
 }
 
 // GetConductorClaudeMCPs returns the conductor-specific [mcps.X] catalog
-// names, if configured. Same floor semantics as GetConductorClaudeSkills.
+// names, if configured. Same floor semantics as GetConductorClaudePlugins.
 func (c *UserConfig) GetConductorClaudeMCPs(name string) []string {
 	if c == nil || name == "" || c.Conductors == nil {
 		return nil
@@ -1678,6 +1817,14 @@ type OpenCodeSettings struct {
 	// Command overrides the default binary/invocation for OpenCode sessions.
 	// Supports flags (e.g., "opencode --custom-flag"). Default: "opencode"
 	Command string `toml:"command,omitempty"`
+
+	// DisableSSEStatus turns off SSE-based status tracking (issue #1614).
+	// By default agent-deck launches OpenCode with an explicit --port so its
+	// /event SSE stream can drive real-time status (green while busy, yellow
+	// when waiting) instead of tmux content sniffing. Set true if your
+	// OpenCode version predates the top-level --port flag or you don't want
+	// a localhost event server bound per session.
+	DisableSSEStatus bool `toml:"disable_sse_status,omitempty"`
 }
 
 // CodexSettings defines Codex CLI configuration
@@ -1714,6 +1861,26 @@ func (c *UserConfig) GetProfileCodexConfigDir(profile string) string {
 		return ""
 	}
 	return ExpandPath(profileCfg.Codex.ConfigDir)
+}
+
+// CursorSettings defines Cursor Agent CLI integration configuration (Issue #1672).
+type CursorSettings struct {
+	// HooksEnabled enables Cursor Agent CLI hooks for real-time status detection.
+	// When enabled, agent-deck silently injects lifecycle hooks into
+	// ~/.cursor/hooks.json on TUI startup whenever the cursor binary is on PATH.
+	// Set false to durably opt out of that auto-install; `agent-deck
+	// cursor-hooks uninstall` persists this automatically so the uninstall
+	// survives TUI restarts. Mirrors [claude] hooks_enabled.
+	// Default: true (nil = use default true, set false to disable)
+	HooksEnabled *bool `toml:"hooks_enabled,omitempty"`
+}
+
+// GetHooksEnabled returns whether Cursor Agent hooks are enabled, defaulting to true
+func (c *CursorSettings) GetHooksEnabled() bool {
+	if c.HooksEnabled == nil {
+		return true
+	}
+	return *c.HooksEnabled
 }
 
 // CopilotSettings defines GitHub Copilot CLI configuration (Issue #556).
@@ -1822,6 +1989,49 @@ type WorktreeSettings struct {
 	// systemd, docker). Reporter @Clindbergh flagged the v1.7.65 behaviour
 	// (`0 = default`) as counter-convention in the PR review for #727.
 	SetupTimeoutSeconds *int `toml:"setup_timeout_seconds,omitempty"`
+
+	// SparseCheckout controls whether a new worktree inherits the invoking
+	// worktree's sparse-checkout configuration (issue #1708):
+	//   ""/"off" (default) → today's behavior: plain `git worktree add`
+	//   "inherit"          → capture the source worktree's mode + patterns and
+	//                        create with --no-checkout, so a sparse monorepo
+	//                        never materializes the full tree first
+	// Unknown values are treated as "off" so a typo can never change checkout
+	// behavior. String (not bool) to leave room for future modes.
+	SparseCheckout string `toml:"sparse_checkout,omitempty"`
+
+	// RunRepoScripts controls whether .agent-deck/worktree-setup.sh and
+	// worktree-destruction.sh — arbitrary shell content committed to the
+	// repo, run with the caller's full environment (SSH agent, tokens) — are
+	// allowed to execute automatically:
+	//   "prompt" (default, "" also means prompt) → run only after a human
+	//     approves the exact script content once (per repo root + SHA-256);
+	//     re-prompts if the content changes; non-interactive callers (a
+	//     remote worktree-mutation request, a CI job) fail closed instead
+	//     of hanging or silently executing.
+	//   "always" → pre-gate behavior: run unconditionally, no prompt. Opt-in.
+	//   "never"  → never run these scripts, trusted or not.
+	// Unknown values are treated as "prompt" so a typo can never downgrade
+	// to "always". See --allow-repo-scripts / AGENT_DECK_ALLOW_REPO_SCRIPTS
+	// for a one-shot, non-persisted bypass (CI).
+	RunRepoScripts string `toml:"run_repo_scripts,omitempty"`
+}
+
+// ScriptConsentPolicy returns the parsed [worktree] run_repo_scripts value.
+// Unset/unknown values resolve to git.ScriptConsentPrompt (fail closed).
+func (w WorktreeSettings) ScriptConsentPolicy() git.ScriptConsentPolicy {
+	return git.ParseScriptConsentPolicy(w.RunRepoScripts)
+}
+
+// WorktreeSparseCheckoutInherit is the only value of [worktree] sparse_checkout
+// that turns inheritance on (#1708).
+const WorktreeSparseCheckoutInherit = "inherit"
+
+// InheritSparseCheckout reports whether worktree creation should inherit the
+// invoking worktree's sparse-checkout state. Matching is case- and
+// whitespace-insensitive; every other value (including "off" and typos) is false.
+func (w WorktreeSettings) InheritSparseCheckout() bool {
+	return strings.EqualFold(strings.TrimSpace(w.SparseCheckout), WorktreeSparseCheckoutInherit)
 }
 
 // DefaultWorktreeSetupTimeout is the fallback used when no explicit value is
@@ -3320,6 +3530,15 @@ func MergeToolPatterns(toolName string) *tmux.RawPatterns {
 		return nil
 	}
 
+	// #1577: a custom tool with no built-in defaults of its own inherits the
+	// preset it declares via `compatible_with`. This only fires when the tool
+	// name has no built-in patterns (defaults == nil), so every built-in tool
+	// is byte-identical in behavior. Explicit replace/extra fields on the
+	// ToolDef still override below.
+	if defaults == nil && toolDef != nil && strings.TrimSpace(toolDef.CompatibleWith) != "" {
+		defaults = tmux.DefaultRawPatterns(toolDef.CompatibleWith)
+	}
+
 	// Build overrides from ToolDef's replace fields (BusyPatterns, PromptPatterns, SpinnerChars)
 	var overrides *tmux.RawPatterns
 	if toolDef != nil && (toolDef.BusyPatterns != nil || toolDef.PromptPatterns != nil || toolDef.SpinnerChars != nil) {
@@ -3363,6 +3582,104 @@ func GetWebMutationsEnabled() bool {
 		return true
 	}
 	return *config.Web.MutationsEnabled
+}
+
+// GetWebTrustedDomains returns the normalized `[web].trusted_domains` hosts.
+// Links whose host matches an entry skip the web terminal's link-open confirm
+// (issue #1682). Returns an empty slice when the key is absent, so the
+// confirm stays on for everything by default.
+func GetWebTrustedDomains() []string {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return nil
+	}
+	return NormalizeTrustedDomains(config.Web.TrustedDomains)
+}
+
+// GetWebConfirmLinkOpen reports whether the web terminal confirms before
+// opening a link whose host is not on `[web].trusted_domains`. Defaults to
+// true when `[web].confirm_link_open` is omitted.
+func GetWebConfirmLinkOpen() bool {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil || config.Web.ConfirmLinkOpen == nil {
+		return true
+	}
+	return *config.Web.ConfirmLinkOpen
+}
+
+// NormalizeTrustedDomains reduces raw `[web].trusted_domains` entries to
+// lowercase hosts suitable for exact comparison against a URL host:
+//
+//   - "https://gitlab.corp.example/group/repo" -> "gitlab.corp.example"
+//   - "GitLab.Corp.Example:8443"               -> "gitlab.corp.example"
+//   - "*.corp.example"                         -> "*.corp.example" (subdomains)
+//
+// Blank entries, bare wildcards ("*", "*."), and entries that carry no host
+// are dropped. Duplicates are removed, input order is preserved.
+func NormalizeTrustedDomains(entries []string) []string {
+	out := make([]string, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, raw := range entries {
+		host := normalizeTrustedDomain(raw)
+		if host == "" {
+			continue
+		}
+		if _, dup := seen[host]; dup {
+			continue
+		}
+		seen[host] = struct{}{}
+		out = append(out, host)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// normalizeTrustedDomain normalizes one entry; "" means "unusable, drop it".
+func normalizeTrustedDomain(raw string) string {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	if s == "" {
+		return ""
+	}
+	// Accept a pasted URL: strip scheme, then anything from the first
+	// path/query/fragment separator onward.
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	if i := strings.IndexAny(s, "/?#"); i >= 0 {
+		s = s[:i]
+	}
+	// Strip userinfo ("user:pass@host") — the host is what we match on.
+	if i := strings.LastIndex(s, "@"); i >= 0 {
+		s = s[i+1:]
+	}
+	wildcard := strings.HasPrefix(s, "*.")
+	if wildcard {
+		s = s[2:]
+	}
+	// Strip the port. Bracketed IPv6 literals keep their brackets so the
+	// colons inside are not mistaken for a port separator.
+	if strings.HasPrefix(s, "[") {
+		if i := strings.Index(s, "]"); i >= 0 {
+			s = s[:i+1]
+		}
+	} else if i := strings.LastIndex(s, ":"); i >= 0 && !strings.Contains(s[i+1:], ":") {
+		s = s[:i]
+	}
+	s = strings.TrimSuffix(s, ".")
+	if s == "" || strings.ContainsAny(s, " \t*") {
+		return ""
+	}
+	if wildcard {
+		// A subdomain wildcard needs a registrable base with a dot, else
+		// "*.example" would silently allow every single-label host.
+		if !strings.Contains(s, ".") {
+			return ""
+		}
+		return "*." + s
+	}
+	return s
 }
 
 // GetHotkeyOverrides returns user-configured hotkey overrides from config.toml.
@@ -3831,6 +4148,22 @@ func CreateExampleConfig() error {
 #                             # cycle forward (Ctrl+A to go back); it auto-
 #                             # attaches ~1s after you stop, Enter attaches now,
 #                             # Esc cancels. Same key opens it from the list.
+# Scrollback pager (issue #1491). The deck's Enter-attach renders the session in
+# tmux control mode, where the deck owns the viewport and tmux's own copy-mode /
+# mouse-wheel scrollback is unreachable. This trigger opens an in-view scrollable
+# pager over the pane's history so you can reach the start of a long session
+# without leaving agent-deck. Inside: Up/Down/j/k, PgUp/PgDn, g=start, G=live end,
+# wheel scrolls, Esc re-attaches, Ctrl+Q returns to the list.
+#   "pageup"  (default) a bare PageUp opens the pager; modified PageUp passes
+#             through to the attached program. When the attached app is in the
+#             alternate screen (a full-screen TUI such as Claude fullscreen),
+#             bare PageUp also passes through so the app's own scrollback works —
+#             the pager would be empty there (alt-screen keeps no tmux history).
+#   "ctrl+<letter>"  a control chord opens it (use if a pager/editor inside the
+#             session needs PageUp). A chord that collides with detach/switch is
+#             dropped.
+#   ""        disables the feature.
+# scrollback = "pageup"
 
 # Instance behavior (optional)
 # [instances]
@@ -3878,6 +4211,9 @@ func CreateExampleConfig() error {
 # default_model = "anthropic/claude-sonnet-4-5-20250929"
 # Default agent for new sessions
 # default_agent = ""
+# Disable SSE-based status tracking (issue #1614). When disabled, OpenCode is
+# launched without --port and status falls back to tmux content sniffing.
+# disable_sse_status = true
 
 # Codex CLI integration
 # [codex]
@@ -3942,6 +4278,12 @@ auto_cleanup = true
 #   {branch}         -> sanitized (human-friendly, may collide)
 #   {branch-escaped} -> URL-escaped (collision-resistant, reversible)
 # path_template = "../worktrees/{repo-name}/{branch}"
+# Whether .agent-deck/worktree-setup.sh and worktree-destruction.sh may run
+# automatically: "prompt" (default, ask once per repo root + script content,
+# re-asks if the content changes), "always" (run unconditionally, pre-gate
+# behavior), or "never" (block them entirely). Non-interactive callers under
+# "prompt" fail closed instead of hanging; see --allow-repo-scripts for CI.
+# run_repo_scripts = "prompt"
 
 # Default scope for MCP operations: "local", "global", or "user"
 # "local" writes to .mcp.json (project-only, default)
@@ -4491,6 +4833,86 @@ func (s SystemStatsSettings) GetShow() []string {
 		return s.Show
 	}
 	return []string{"cpu", "ram", "disk", "network"}
+}
+
+// IntervalHookSettings configures a single interval hook: a shell command run
+// on a wall-clock cadence while the TUI is running, independent of any session
+// activity. This is a general-purpose "cron inside the TUI" primitive — e.g. a
+// periodic sync, a health probe, or a poll that dispatches work to sessions via
+// the `agent-deck session` CLI. The command runs through `bash -lc`.
+type IntervalHookSettings struct {
+	// Command is the shell command to run each tick (via `bash -lc <command>`).
+	Command string `toml:"command,omitempty"`
+
+	// IntervalSeconds is the cadence between runs. Clamped to [5, 86400].
+	// Default: 60.
+	IntervalSeconds int `toml:"interval_seconds,omitzero"`
+
+	// Enabled gates the hook. Defaults to true when a Command is set, so a
+	// bare [interval_hooks.name] with a command is live without extra config;
+	// set false to keep the config but pause it.
+	Enabled *bool `toml:"enabled,omitempty"`
+
+	// TimeoutSeconds bounds a single run; a hook exceeding it is killed so a
+	// wedged command can't pile up. Clamped to [1, IntervalSeconds]. Default:
+	// min(30, interval).
+	TimeoutSeconds int `toml:"timeout_seconds,omitzero"`
+
+	// RunAtStartup runs the command once immediately when the TUI starts,
+	// before the first interval elapses. Default: false.
+	RunAtStartup bool `toml:"run_at_startup,omitempty"`
+}
+
+// Interval-hook bounds. IntervalSeconds has a 5s floor so a misconfigured hook
+// can't busy-loop, and a 1-day ceiling.
+const (
+	DefaultIntervalHookSeconds = 60
+	MinIntervalHookSeconds     = 5
+	MaxIntervalHookSeconds     = 86400
+	DefaultIntervalHookTimeout = 30
+)
+
+// GetEnabled reports whether the hook should run. A hook with a non-empty
+// Command defaults to enabled; an explicit `enabled = false` pauses it.
+func (h IntervalHookSettings) GetEnabled() bool {
+	if h.Enabled != nil {
+		return *h.Enabled
+	}
+	return strings.TrimSpace(h.Command) != ""
+}
+
+// GetIntervalSeconds returns the cadence, clamped to
+// [MinIntervalHookSeconds, MaxIntervalHookSeconds]. Unset falls back to
+// DefaultIntervalHookSeconds.
+func (h IntervalHookSettings) GetIntervalSeconds() int {
+	if h.IntervalSeconds <= 0 {
+		return DefaultIntervalHookSeconds
+	}
+	if h.IntervalSeconds < MinIntervalHookSeconds {
+		return MinIntervalHookSeconds
+	}
+	if h.IntervalSeconds > MaxIntervalHookSeconds {
+		return MaxIntervalHookSeconds
+	}
+	return h.IntervalSeconds
+}
+
+// GetTimeoutSeconds returns the per-run timeout, clamped to
+// [1, GetIntervalSeconds()]. Unset falls back to min(DefaultIntervalHookTimeout,
+// interval) so a run never outlives its own cadence.
+func (h IntervalHookSettings) GetTimeoutSeconds() int {
+	interval := h.GetIntervalSeconds()
+	t := h.TimeoutSeconds
+	if t <= 0 {
+		t = DefaultIntervalHookTimeout
+	}
+	if t > interval {
+		t = interval
+	}
+	if t < 1 {
+		t = 1
+	}
+	return t
 }
 
 // WatcherSettings configures the event watcher system.

@@ -302,14 +302,23 @@ func Test_clampViewToViewport_TruncatesButNeverPads(t *testing.T) {
 	if len(lines) != height {
 		t.Fatalf("want %d lines, got %d", height, len(lines))
 	}
+	// #699 (upstream, merged) wraps every physical row in zero-width SGR resets
+	// to isolate preview-background bleed across Bubble Tea's incremental
+	// repaint. Those resets are zero terminal cells, so they neither pad nor
+	// trigger the wide-glyph wrap this test guards against. Strip them before
+	// asserting each row's content is untouched (never padded to full width) so
+	// the fork's no-pad invariant and upstream's SGR-isolation invariant compose.
+	stripReset := func(s string) string {
+		return strings.TrimSuffix(strings.TrimPrefix(s, "\x1b[0m"), "\x1b[0m")
+	}
 	if got := cellWidth(lines[0]); got != width {
 		t.Fatalf("overlong row cellWidth = %d; want %d (must be truncated)", got, width)
 	}
-	if lines[1] != "short" {
-		t.Fatalf("short row = %q; want %q untouched (padding to full width wraps on emulators that draw emoji-class glyphs wide)", lines[1], "short")
+	if got := stripReset(lines[1]); got != "short" {
+		t.Fatalf("short row = %q; want %q untouched (padding to full width wraps on emulators that draw emoji-class glyphs wide)", got, "short")
 	}
-	if lines[2] != "" {
-		t.Fatalf("blank row = %q; want empty (padding to full width wraps on emulators that draw emoji-class glyphs wide)", lines[2])
+	if got := stripReset(lines[2]); got != "" {
+		t.Fatalf("blank row = %q; want empty (padding to full width wraps on emulators that draw emoji-class glyphs wide)", got)
 	}
 }
 

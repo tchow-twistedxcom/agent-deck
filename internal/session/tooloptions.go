@@ -26,6 +26,8 @@ type ClaudeOptions struct {
 	Model string `json:"model,omitempty"`
 	// UseHappy launches Claude via the happy wrapper
 	UseHappy bool `json:"use_happy,omitempty"`
+	// Effort sets Claude Code's per-session --effort level.
+	Effort string `json:"effort,omitempty"`
 	// SkipPermissions adds --dangerously-skip-permissions flag
 	SkipPermissions bool `json:"skip_permissions,omitempty"`
 	// AllowSkipPermissions adds --allow-dangerously-skip-permissions flag
@@ -100,6 +102,9 @@ func (o *ClaudeOptions) ToArgs() []string {
 	if o.Model != "" {
 		args = append(args, "--model", o.Model)
 	}
+	if o.Effort != "" {
+		args = append(args, "--effort", o.Effort)
+	}
 
 	// Permission flags (mutually exclusive, SkipPermissions takes precedence)
 	if o.SkipPermissions {
@@ -126,6 +131,9 @@ func (o *ClaudeOptions) ToArgsForFork() []string {
 
 	if o.Model != "" {
 		args = append(args, "--model", o.Model)
+	}
+	if o.Effort != "" {
+		args = append(args, "--effort", o.Effort)
 	}
 	if o.SkipPermissions {
 		args = append(args, "--dangerously-skip-permissions")
@@ -170,6 +178,8 @@ func NewClaudeOptions(config *UserConfig) *ClaudeOptions {
 type CodexOptions struct {
 	// Model overrides the Codex model for this session (for example, "gpt-5").
 	Model string `json:"model,omitempty"`
+	// ReasoningEffort overrides Codex model_reasoning_effort for this session.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 	// YoloMode enables --yolo flag (bypass approvals and sandbox)
 	// nil = inherit from global config, true/false = explicit override
 	YoloMode *bool `json:"yolo_mode,omitempty"`
@@ -188,6 +198,9 @@ func (o *CodexOptions) ToArgs() []string {
 	var args []string
 	if o.Model != "" {
 		args = append(args, "--model", o.Model)
+	}
+	if o.ReasoningEffort != "" {
+		args = append(args, "--config", "model_reasoning_effort="+o.ReasoningEffort)
 	}
 	if o.YoloMode != nil && *o.YoloMode {
 		args = append(args, "--yolo")

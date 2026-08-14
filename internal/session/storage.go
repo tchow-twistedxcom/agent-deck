@@ -37,25 +37,35 @@ type StorageData struct {
 
 // InstanceData represents the serializable session data
 type InstanceData struct {
-	ID                  string    `json:"id"`
-	Title               string    `json:"title"`
-	ProjectPath         string    `json:"project_path"`
-	GroupPath           string    `json:"group_path"`
-	Order               int       `json:"order"`
-	ParentSessionID     string    `json:"parent_session_id,omitempty"`     // Links to parent session (sub-session support)
-	IsConductor         bool      `json:"is_conductor,omitempty"`          // True if this session is a conductor orchestrator
-	NoTransitionNotify  bool      `json:"no_transition_notify,omitempty"`  // Suppress transition event dispatch
-	TitleLocked         bool      `json:"title_locked,omitempty"`          // #697: block Claude session-name sync into Title
-	AutoName            bool      `json:"auto_name,omitempty"`             // marks Title as a machine-generated quick-session handle
-	AutoNameDescription string    `json:"auto_name_description,omitempty"` // last captured Claude task description for an AutoName session
-	Command             string    `json:"command"`
-	Wrapper             string    `json:"wrapper,omitempty"`
-	Tool                string    `json:"tool"`
-	Status              Status    `json:"status"`
-	CreatedAt           time.Time `json:"created_at"`
-	LastAccessedAt      time.Time `json:"last_accessed_at,omitempty"`
-	ArchivedAt          time.Time `json:"archived_at,omitempty"`
-	TmuxSession         string    `json:"tmux_session"`
+	ID                 string `json:"id"`
+	Title              string `json:"title"`
+	ProjectPath        string `json:"project_path"`
+	GroupPath          string `json:"group_path"`
+	Order              int    `json:"order"`
+	ParentSessionID    string `json:"parent_session_id,omitempty"`    // Links to parent session (sub-session support)
+	IsConductor        bool   `json:"is_conductor,omitempty"`         // True if this session is a conductor orchestrator
+	NoTransitionNotify bool   `json:"no_transition_notify,omitempty"` // Suppress transition event dispatch
+	TitleLocked        bool   `json:"title_locked,omitempty"`         // #697: block Claude session-name sync into Title
+	// SubcommandPassthrough mirrors Instance.SubcommandPassthrough (#1821).
+	// Persisted via the tool_data extras zone (see
+	// WriteSubcommandPassthroughToToolData), not a dedicated SQL column, so
+	// it round-trips across binary versions without a schema migration.
+	SubcommandPassthrough bool      `json:"subcommand_passthrough,omitempty"`
+	AutoName              bool      `json:"auto_name,omitempty"`             // marks Title as a machine-generated quick-session handle
+	AutoNameDescription   string    `json:"auto_name_description,omitempty"` // last captured Claude task description for an AutoName session
+	Command               string    `json:"command"`
+	Wrapper               string    `json:"wrapper,omitempty"`
+	Tool                  string    `json:"tool"`
+	Status                Status    `json:"status"`
+	CreatedAt             time.Time `json:"created_at"`
+	LastAccessedAt        time.Time `json:"last_accessed_at,omitempty"`
+	// LastStartedAt mirrors Instance.LastStartedAt (issue #30 / #1704 fix).
+	// Persisted via the tool_data extras zone (see last_started_persist.go),
+	// not a typed SQL column. Zero means unknown (old record or never
+	// started).
+	LastStartedAt time.Time `json:"last_started_at,omitempty"`
+	ArchivedAt    time.Time `json:"archived_at,omitempty"`
+	TmuxSession   string    `json:"tmux_session"`
 	// TmuxSocketName is the tmux -L selector captured at Instance creation
 	// (issue #687, v1.7.50). Empty for pre-v1.7.50 rows — those keep hitting
 	// the default server after upgrade.
@@ -77,6 +87,11 @@ type InstanceData struct {
 	// Claude session (persisted for resume after app restart)
 	ClaudeSessionID  string    `json:"claude_session_id,omitempty"`
 	ClaudeDetectedAt time.Time `json:"claude_detected_at,omitempty"`
+	// #1815: true when ClaudeSessionID came from a disk scan and was never
+	// verified as this session's own. Persisted so the taint survives a
+	// process restart and the id can never launder itself into a resumable
+	// one just by being written and read back.
+	ClaudeSessionIDUnverified bool `json:"claude_session_id_unverified,omitempty"`
 
 	// Gemini session (persisted for resume after app restart)
 	GeminiSessionID  string    `json:"gemini_session_id,omitempty"`
@@ -189,8 +204,12 @@ func NewStorageWithProfile(profile string) (*Storage, error) {
 		}
 	}
 
-	// Get effective profile
-	effectiveProfile := GetEffectiveProfile(profile)
+	// Get effective profile, guarding against silently auto-creating a
+	// profile that was merely inferred from CLAUDE_CONFIG_DIR (#1790).
+	effectiveProfile, err := ResolveProfileForStorage(profile)
+	if err != nil {
+		return nil, err
+	}
 
 	// Get profile directory
 	profileDir, err := GetProfileDir(effectiveProfile)
@@ -301,7 +320,15 @@ func (s *Storage) Save(instances []*Instance) error {
 }
 
 // SaveWithGroups persists instances and groups to SQLite.
-// Converts Instance objects to database rows, then batch-inserts in a transaction.
+// Converts Instance objects to database rows, then batch-upserts in a transaction.
+//
+// UPSERT-ONLY (#1550): this path never deletes rows. It used to route through
+// statedb.SaveInstances, whose `DELETE FROM instances WHERE id NOT IN (...)`
+// sweep let any process holding a stale snapshot silently delete sessions a
+// concurrent process created after that snapshot was loaded (the TUI-side twin
+// of #909/#1031). Deletions must be explicit and targeted instead:
+// DeleteInstance / RemoveSessionAndVerify at the moment the user deletes a
+// session, or statedb.ClearAllInstances for an intentional full wipe.
 func (s *Storage) SaveWithGroups(instances []*Instance, groupTree *GroupTree) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -324,7 +351,7 @@ func (s *Storage) SaveWithGroups(instances []*Instance, groupTree *GroupTree) er
 		rows[i] = row
 	}
 
-	if err := s.db.SaveInstances(rows); err != nil {
+	if err := s.db.UpsertInstances(rows); err != nil {
 		return fmt.Errorf("failed to save instances: %w", err)
 	}
 
@@ -352,6 +379,28 @@ func (s *Storage) SaveWithGroups(instances []*Instance, groupTree *GroupTree) er
 	return nil
 }
 
+// UpdateTitleIfUnlocked sets an instance's title with a single conditional
+// UPDATE that only applies while the row is still unlocked at write time —
+// see StateDB.UpdateTitleIfUnlocked for why this must be a targeted write
+// rather than a full instance-list round-trip.
+func (s *Storage) UpdateTitleIfUnlocked(id, title string) (applied bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.db == nil {
+		return false, fmt.Errorf("storage database not initialized")
+	}
+
+	applied, err = s.db.UpdateTitleIfUnlocked(id, title)
+	if err != nil {
+		return false, fmt.Errorf("failed to update title for instance %s: %w", id, err)
+	}
+	if applied {
+		_ = s.db.Touch()
+	}
+	return applied, nil
+}
+
 // DeleteInstance removes a single instance from the database by ID.
 // This ensures the row is immediately removed, preventing resurrection on reload.
 func (s *Storage) DeleteInstance(id string) error {
@@ -364,6 +413,26 @@ func (s *Storage) DeleteInstance(id string) error {
 
 	if err := s.db.DeleteInstance(id); err != nil {
 		return fmt.Errorf("failed to delete instance %s: %w", id, err)
+	}
+
+	_ = s.db.Touch()
+	return nil
+}
+
+// DeleteGroupSubtree removes a group and all of its descendants from the groups
+// table. SaveGroups is additive (upsert, never prune), so intentional group
+// removal — delete, rename, move — must call this explicitly; otherwise the old
+// path rows linger and the group resurrects on the next reload.
+func (s *Storage) DeleteGroupSubtree(path string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.db == nil {
+		return fmt.Errorf("storage database not initialized")
+	}
+
+	if err := s.db.DeleteGroupSubtree(path); err != nil {
+		return fmt.Errorf("failed to delete group subtree %s: %w", path, err)
 	}
 
 	_ = s.db.Touch()
@@ -587,6 +656,122 @@ func (s *Storage) InsertSessionAndVerify(newInstance *Instance, groupTree *Group
 	return fmt.Errorf("%w: %s", ErrInsertNotPersistent, newInstance.ID)
 }
 
+// SyncInstanceCwd swaps the persisted project_path for id to newCwd, but ONLY
+// when newCwd is one of the instance's explicitly declared additional_paths
+// (the multi-repo primary swap). Reports whether the instance was found in
+// this profile.
+//
+// Issue #1729: project_path is identity, set at creation. It must never be
+// silently rewritten from an observed hook-payload cwd — a legitimate `cd`
+// into a subdir would relocate the recorded path away from the Claude project
+// slug that holds the transcript, breaking the next resume; and foreign
+// headless `claude -p` workers (which inherit AGENTDECK_INSTANCE_ID and fire
+// hooks with cwd=$TMPDIR) would flap it to their temp dir and back. Membership
+// in additional_paths is user-declared, so swapping among those paths is an
+// explicit operation; anything else is refused. The only other sanctioned
+// mutation is the documented `agent-deck session set <title> path <p>`.
+func (s *Storage) SyncInstanceCwd(id, newCwd string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return false, fmt.Errorf("storage database not initialized")
+	}
+	row, err := s.db.LoadInstanceByID(id)
+	if err != nil {
+		return false, err
+	}
+	if row == nil {
+		return false, nil
+	}
+	if row.ProjectPath == newCwd {
+		return true, nil
+	}
+	if !toolDataDeclaresAdditionalPath(row.ToolData, newCwd) {
+		storageLog.Debug("cwd_sync_refused_undeclared_path",
+			slog.String("instance", id),
+			slog.String("project_path", row.ProjectPath),
+			slog.String("reported_cwd", newCwd),
+			slog.String("reason", "project_path_immutable_outside_declared_paths"),
+		)
+		return true, nil
+	}
+	newToolData, err := swapAdditionalPath(row.ToolData, row.ProjectPath, newCwd)
+	if err != nil {
+		return true, err
+	}
+	row.ToolData = newToolData
+	row.ProjectPath = newCwd
+	row.LastAccessed = time.Now()
+	if err := s.db.SaveInstance(row); err != nil {
+		return true, fmt.Errorf("failed to persist cwd for %s: %w", id, err)
+	}
+	_ = s.db.Touch()
+	return true, nil
+}
+
+// toolDataDeclaresAdditionalPath reports whether cwd is an explicitly declared
+// additional_paths entry in the tool_data blob. Only these user-declared paths
+// are legal targets for the SyncInstanceCwd primary swap (issue #1729).
+func toolDataDeclaresAdditionalPath(toolData json.RawMessage, cwd string) bool {
+	if len(toolData) == 0 {
+		return false
+	}
+	var blob struct {
+		AdditionalPaths []string `json:"additional_paths"`
+	}
+	if err := json.Unmarshal(toolData, &blob); err != nil {
+		return false
+	}
+	for _, p := range blob.AdditionalPaths {
+		if p == cwd {
+			return true
+		}
+	}
+	return false
+}
+
+// swapAdditionalPath rewrites the additional_paths list in a tool_data blob so
+// that if newCwd is present, its slot is replaced by oldCwd (multi-repo swap).
+// All other tool_data keys are preserved verbatim.
+func swapAdditionalPath(toolData json.RawMessage, oldCwd, newCwd string) (json.RawMessage, error) {
+	if len(toolData) == 0 {
+		return toolData, nil
+	}
+	var blob map[string]json.RawMessage
+	if err := json.Unmarshal(toolData, &blob); err != nil {
+		return toolData, nil
+	}
+	raw, ok := blob["additional_paths"]
+	if !ok || len(raw) == 0 {
+		return toolData, nil
+	}
+	var paths []string
+	if err := json.Unmarshal(raw, &paths); err != nil {
+		return toolData, nil
+	}
+	swapped := false
+	for i, p := range paths {
+		if p == newCwd {
+			paths[i] = oldCwd
+			swapped = true
+			break
+		}
+	}
+	if !swapped {
+		return toolData, nil
+	}
+	updated, err := json.Marshal(paths)
+	if err != nil {
+		return toolData, err
+	}
+	blob["additional_paths"] = updated
+	out, err := json.Marshal(blob)
+	if err != nil {
+		return toolData, err
+	}
+	return out, nil
+}
+
 // saveSingleInstance writes one row via the targeted SaveInstance path
 // (single-row INSERT OR REPLACE — no DELETE-NOT-IN sweep). Wraps the
 // statedb call in the storage mutex and the nil-db guard so callers
@@ -654,6 +839,44 @@ func (s *Storage) PersistRevivedInstances(instances []*Instance) error {
 	return s.db.PersistInstanceStatusesTx(updates)
 }
 
+// PersistRecoveredInstances persists the rows a fleet-recovery sweep restarted,
+// and ONLY those rows.
+//
+// Why it is not PersistRevivedInstances: a revive mutates exactly one field
+// (Status), so that method can use a status-only UPDATE. A restart replaces the
+// process — status, tmux session name, socket, and the tool conversation id in
+// tool_data can all change — so the recovered rows need a full-row write.
+//
+// Why it is not SaveWithGroups: that path converts and rewrites EVERY instance
+// in the caller's snapshot. During a 65-session recovery the sweep runs for
+// minutes, so its snapshot is stale by construction, and a full rewrite would
+// push stale columns over any edit another process made to a session the sweep
+// never touched. Writing one targeted row per restarted session (via
+// statedb.SaveInstance, which merges tool_data extras and auto-name fields
+// rather than blindly replacing them) keeps the blast radius to the sessions
+// the sweep actually owns. No path here deletes anything: there is no
+// DELETE-NOT-IN sweep, so a session added concurrently can never be lost
+// (the 2026-06-04 data-loss class).
+//
+// Errors are per-row and returned joined, so one bad row does not hide the rest.
+func (s *Storage) PersistRecoveredInstances(instances []*Instance) error {
+	var errs []error
+	for _, inst := range instances {
+		if inst == nil {
+			continue
+		}
+		row, err := instanceToRow(inst)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("convert %s: %w", inst.ID, err))
+			continue
+		}
+		if err := s.saveSingleInstance(row); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // instanceToRow converts a session.Instance into the statedb row shape.
 // Shared by SaveWithGroups (bulk path) and InsertSessionAndVerify
 // (targeted single-row path) so the marshal/normalize logic stays in
@@ -719,6 +942,32 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 	// the positional MarshalToolData signature so legacy binaries that don't
 	// know the key preserve it via MergeToolDataExtras.
 	toolData = WriteIdleTimeoutSecsToToolData(toolData, inst.IdleTimeoutSecs)
+	// #1821: subcommand_passthrough lives in the same extras zone — see
+	// Instance.SubcommandPassthrough's doc for why losing it on reload must
+	// never silently re-enable claude/codex account-routing treatment for a
+	// command that was never explicitly validated as one.
+	toolData = WriteSubcommandPassthroughToToolData(toolData, inst.SubcommandPassthrough)
+	// #1815: the resume-identity taint travels with the id it describes, so a
+	// writer that saves a discovered conversation id without ever passing
+	// through the resume builder (e.g. `switch-account --no-restart`) cannot
+	// leave an unverified id on disk that the next process treats as recorded.
+	//
+	// Only write the marker when there is a current id to describe it. When
+	// inst.ClaudeSessionID is empty, claude_session_id is OMITTED from this
+	// blob (MarshalToolData's omitempty) and MergeToolDataExtras carries the
+	// prior sticky-preserved id forward unchanged; the taint marker must be
+	// omitted too so it rides along with that same carried-forward id instead
+	// of being overwritten with an explicit `false`. Writing an explicit
+	// false here would erase a persisted taint while the tainted id itself
+	// survives via the sticky merge -- reopening #1815 through this exact
+	// persistence layer (review finding on #1830).
+	if inst.ClaudeSessionID != "" {
+		toolData = WriteClaudeSessionUnverifiedToToolData(toolData, inst.claudeSessionIDIsUnverified())
+	}
+	// #1704 blocker fix: same extras-zone treatment for last_started_at, so
+	// `status --stale` (and ShouldSkipRestart's freshness guard) see a real
+	// value from a fresh CLI process instead of always-zero.
+	toolData = WriteLastStartedAtToToolData(toolData, inst.LastStartedAt)
 
 	return &statedb.InstanceRow{
 		ID:                  inst.ID,
@@ -890,6 +1139,9 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			AutoLinkedChannels:        autoLinkedChannels2,
 			Color:                     color2,
 			IdleTimeoutSecs:           ReadIdleTimeoutSecsFromToolData(r.ToolData),
+			SubcommandPassthrough:     ReadSubcommandPassthroughFromToolData(r.ToolData),
+			ClaudeSessionIDUnverified: ReadClaudeSessionUnverifiedFromToolData(r.ToolData),
+			LastStartedAt:             ReadLastStartedAtFromToolData(r.ToolData),
 		}
 	}
 
@@ -1009,6 +1261,9 @@ func (s *Storage) LoadWithGroups() ([]*Instance, []*GroupData, error) {
 			AutoLinkedChannels:        autoLinkedChannels,
 			Color:                     color,
 			IdleTimeoutSecs:           ReadIdleTimeoutSecsFromToolData(r.ToolData),
+			SubcommandPassthrough:     ReadSubcommandPassthroughFromToolData(r.ToolData),
+			ClaudeSessionIDUnverified: ReadClaudeSessionUnverifiedFromToolData(r.ToolData),
+			LastStartedAt:             ReadLastStartedAtFromToolData(r.ToolData),
 		}
 	}
 
@@ -1097,17 +1352,17 @@ func (s *Storage) GetUpdatedAt() (time.Time, error) {
 	return time.Unix(0, ts), nil
 }
 
-// GetFileMtime returns the filesystem modification time of the database file.
-// This is useful for detecting external changes when polling.
+// GetFileMtime returns the database's last-write timestamp, for detecting that
+// another process changed the profile DB.
+//
+// It deliberately does NOT os.Stat(state.db). SQLite runs in WAL mode here, so a
+// committed write lands in state.db-wal and leaves state.db's mtime unchanged
+// until a checkpoint — statting the main file reports "no change" for every
+// out-of-process write, so the TUI's external-change guard never fired and its
+// next full-table save clobbered CLI writes. metadata.last_modified is the
+// authoritative signal, and the one StorageWatcher already polls.
 func (s *Storage) GetFileMtime() (time.Time, error) {
-	info, err := os.Stat(s.dbPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return time.Time{}, nil
-		}
-		return time.Time{}, err
-	}
-	return info.ModTime(), nil
+	return s.GetUpdatedAt()
 }
 
 // convertToInstances converts StorageData to Instance slice
@@ -1210,59 +1465,62 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 		projectPath := ExpandPath(fixMalformedTildePath(instData.ProjectPath))
 
 		inst := &Instance{
-			ID:                        instData.ID,
-			Title:                     instData.Title,
-			ProjectPath:               projectPath,
-			GroupPath:                 groupPath,
-			Order:                     instData.Order,
-			ParentSessionID:           instData.ParentSessionID,
-			IsConductor:               instData.IsConductor,
-			NoTransitionNotify:        instData.NoTransitionNotify,
-			TitleLocked:               instData.TitleLocked,
-			AutoName:                  instData.AutoName,
-			autoNameDescription:       instData.AutoNameDescription,
-			Command:                   instData.Command,
-			Wrapper:                   instData.Wrapper,
-			Tool:                      instData.Tool,
-			Status:                    instData.Status,
-			CreatedAt:                 instData.CreatedAt,
-			LastAccessedAt:            instData.LastAccessedAt,
-			ArchivedAt:                instData.ArchivedAt,
-			WorktreePath:              instData.WorktreePath,
-			WorktreeRepoRoot:          instData.WorktreeRepoRoot,
-			WorktreeBranch:            instData.WorktreeBranch,
-			Account:                   instData.Account,
-			Pin:                       instData.Pin,
-			TmuxSocketName:            instData.TmuxSocketName,
-			ClaudeSessionID:           instData.ClaudeSessionID,
-			ClaudeDetectedAt:          instData.ClaudeDetectedAt,
-			GeminiSessionID:           instData.GeminiSessionID,
-			GeminiDetectedAt:          instData.GeminiDetectedAt,
-			GeminiYoloMode:            instData.GeminiYoloMode,
-			GeminiModel:               instData.GeminiModel,
-			OpenCodeSessionID:         instData.OpenCodeSessionID,
-			OpenCodeDetectedAt:        instData.OpenCodeDetectedAt,
-			CodexSessionID:            instData.CodexSessionID,
-			CodexDetectedAt:           instData.CodexDetectedAt,
-			ToolOptionsJSON:           instData.ToolOptionsJSON,
-			LatestPrompt:              instData.LatestPrompt,
-			Notes:                     instData.Notes,
-			LoadedMCPNames:            instData.LoadedMCPNames,
-			Channels:                  instData.Channels,
-			ExtraArgs:                 instData.ExtraArgs,
-			Plugins:                   instData.Plugins,
-			PluginChannelLinkDisabled: instData.PluginChannelLinkDisabled,
-			AutoLinkedChannels:        instData.AutoLinkedChannels,
-			Color:                     instData.Color,
-			IdleTimeoutSecs:           instData.IdleTimeoutSecs,
-			Sandbox:                   instData.Sandbox,
-			SandboxContainer:          instData.SandboxContainer,
-			SSHHost:                   instData.SSHHost,
-			SSHRemotePath:             instData.SSHRemotePath,
-			MultiRepoEnabled:          instData.MultiRepoEnabled,
-			AdditionalPaths:           instData.AdditionalPaths,
-			MultiRepoTempDir:          instData.MultiRepoTempDir,
-			tmuxSession:               tmuxSess,
+			ID:                           instData.ID,
+			Title:                        instData.Title,
+			ProjectPath:                  projectPath,
+			GroupPath:                    groupPath,
+			Order:                        instData.Order,
+			ParentSessionID:              instData.ParentSessionID,
+			IsConductor:                  instData.IsConductor,
+			NoTransitionNotify:           instData.NoTransitionNotify,
+			TitleLocked:                  instData.TitleLocked,
+			AutoName:                     instData.AutoName,
+			autoNameDescription:          instData.AutoNameDescription,
+			Command:                      instData.Command,
+			Wrapper:                      instData.Wrapper,
+			Tool:                         instData.Tool,
+			Status:                       instData.Status,
+			CreatedAt:                    instData.CreatedAt,
+			LastAccessedAt:               instData.LastAccessedAt,
+			ArchivedAt:                   instData.ArchivedAt,
+			WorktreePath:                 instData.WorktreePath,
+			WorktreeRepoRoot:             instData.WorktreeRepoRoot,
+			WorktreeBranch:               instData.WorktreeBranch,
+			Account:                      instData.Account,
+			Pin:                          instData.Pin,
+			TmuxSocketName:               instData.TmuxSocketName,
+			ClaudeSessionID:              instData.ClaudeSessionID,
+			ClaudeDetectedAt:             instData.ClaudeDetectedAt,
+			claudeSessionIDsFromDiskScan: restoreClaudeSessionVerification(instData.ClaudeSessionID, instData.ClaudeSessionIDUnverified),
+			GeminiSessionID:              instData.GeminiSessionID,
+			GeminiDetectedAt:             instData.GeminiDetectedAt,
+			GeminiYoloMode:               instData.GeminiYoloMode,
+			GeminiModel:                  instData.GeminiModel,
+			OpenCodeSessionID:            instData.OpenCodeSessionID,
+			OpenCodeDetectedAt:           instData.OpenCodeDetectedAt,
+			CodexSessionID:               instData.CodexSessionID,
+			CodexDetectedAt:              instData.CodexDetectedAt,
+			ToolOptionsJSON:              instData.ToolOptionsJSON,
+			LatestPrompt:                 instData.LatestPrompt,
+			Notes:                        instData.Notes,
+			LoadedMCPNames:               instData.LoadedMCPNames,
+			Channels:                     instData.Channels,
+			ExtraArgs:                    instData.ExtraArgs,
+			Plugins:                      instData.Plugins,
+			PluginChannelLinkDisabled:    instData.PluginChannelLinkDisabled,
+			AutoLinkedChannels:           instData.AutoLinkedChannels,
+			Color:                        instData.Color,
+			IdleTimeoutSecs:              instData.IdleTimeoutSecs,
+			SubcommandPassthrough:        instData.SubcommandPassthrough,
+			LastStartedAt:                instData.LastStartedAt,
+			Sandbox:                      instData.Sandbox,
+			SandboxContainer:             instData.SandboxContainer,
+			SSHHost:                      instData.SSHHost,
+			SSHRemotePath:                instData.SSHRemotePath,
+			MultiRepoEnabled:             instData.MultiRepoEnabled,
+			AdditionalPaths:              instData.AdditionalPaths,
+			MultiRepoTempDir:             instData.MultiRepoTempDir,
+			tmuxSession:                  tmuxSess,
 		}
 		// Convert multi-repo worktree data
 		for _, wt := range instData.MultiRepoWorktrees {

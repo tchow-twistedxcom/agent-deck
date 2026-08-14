@@ -18,7 +18,6 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/clipboard"
 	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/jujutsu"
-	"github.com/asheshgoplani/agent-deck/internal/profile"
 	"github.com/asheshgoplani/agent-deck/internal/send"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
@@ -41,14 +40,24 @@ func handleSession(profile string, args []string) {
 		handleSessionStop(profile, args[1:])
 	case "remove":
 		handleSessionRemove(profile, args[1:])
+	case "cleanup", "prune":
+		handleSessionCleanup(profile, args[1:])
+	case "archive":
+		handleSessionArchive(profile, args[1:])
+	case "unarchive":
+		handleSessionUnarchive(profile, args[1:])
 	case "restart":
 		handleSessionRestart(profile, args[1:])
 	case "revive":
 		handleSessionRevive(profile, args[1:])
 	case "fork":
 		handleSessionFork(profile, args[1:])
+	case "handoff":
+		handleSessionHandoff(profile, args[1:])
 	case "attach":
 		handleSessionAttach(profile, args[1:])
+	case "focus":
+		handleSessionFocus(profile, args[1:])
 	case "show":
 		handleSessionShow(profile, args[1:])
 	case "current":
@@ -74,6 +83,8 @@ func handleSession(profile string, args []string) {
 		handleSessionMove(profile, args[1:])
 	case "send":
 		handleSessionSend(profile, args[1:])
+	case "approve":
+		handleSessionApprove(profile, args[1:])
 	case "send-keys":
 		handleSessionSendKeys(profile, args[1:])
 	case "output":
@@ -101,16 +112,22 @@ func printSessionHelp() {
 	fmt.Println("  start <id>              Start a session's tmux process")
 	fmt.Println("  stop <id>               Stop/kill session process")
 	fmt.Println("  remove <id>             Remove session from registry (stopped/error only; --force to bypass)")
-	fmt.Println("  restart [id] [--all]    Restart session (Claude: reload MCPs)")
+	fmt.Println("  cleanup [--days N]      Purge dead sessions idle N+ days (dry-run unless --yes)")
+	fmt.Println("  archive <id|title>      Stop session and hide it from active lists (retained in storage)")
+	fmt.Println("  unarchive <id|title>    Restore an archived session (does not restart it)")
+	fmt.Println("  restart [id] [--all] [--env KEY=VALUE]  Restart session (Claude: reload MCPs)")
 	fmt.Println("  revive [--all|--name]   Rebuild dead control pipes for errored sessions")
 	fmt.Println("  fork <id>               Fork Claude, OpenCode, Pi, or Codex session with context")
+	fmt.Println("  handoff <id>            Build a cross-tool handoff prompt from the session's conversation (read-only)")
 	fmt.Println("  attach <id>             Attach to session interactively")
+	fmt.Println("  focus <id> [--attach]   Signal the running TUI to select (or --attach) a session")
 	fmt.Println("  show [id]               Show session details (auto-detect current if no id)")
 	fmt.Println("  current                 Show current session and profile (auto-detect)")
 	fmt.Println("  set <id> <field> <value>  Update session property")
 	fmt.Println("  switch-account <id> <account>  Switch Claude account and migrate the conversation")
 	fmt.Println("  move <id> <path>        Move session to a new path (migrates Claude history)")
 	fmt.Println("  send <id> <message>     Send a message to a running session")
+	fmt.Println("  approve <id> [choice]   Resolve a visible Codex approval prompt")
 	fmt.Println("  output <id>             Get the last response from a session")
 	fmt.Println("  children [id]           List sub-sessions with status + last completion")
 	fmt.Println("  search <query>          Search message content across Claude sessions")
@@ -143,6 +160,8 @@ func printSessionHelp() {
 	fmt.Println("  agent-deck session set-title-lock SCRUM-351 off        # Re-enable title sync")
 	fmt.Println("  agent-deck session output my-project                 # Get last response from session")
 	fmt.Println("  agent-deck session output my-project --json          # Get response as JSON")
+	fmt.Println("  agent-deck session archive my-project                # Stop and hide the session")
+	fmt.Println("  agent-deck session unarchive my-project              # Restore an archived session")
 	fmt.Println()
 	fmt.Println("Set command fields:")
 	fmt.Println("  title              Session title")
@@ -168,7 +187,9 @@ func handleSessionStart(profile string, args []string) {
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
 	message := fs.String("message", "", "Initial message to send once agent is ready")
 	messageShort := fs.String("m", "", "Initial message to send once agent is ready (short)")
+	messageFile := fs.String("message-file", "", "Read the initial message from a file ('-' for stdin); avoids shell quoting of long prompts")
 	yoloMode := fs.Bool("yolo", false, "Enable YOLO mode when starting Gemini or Codex sessions")
+	attach := fs.Bool("attach", false, "Attach to the session after starting (requires an interactive terminal)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck session start <id|title> [options]")
@@ -182,6 +203,8 @@ func handleSessionStart(profile string, args []string) {
 		fmt.Println("  agent-deck session start my-project")
 		fmt.Println("  agent-deck session start my-project --message \"Research MCP patterns\"")
 		fmt.Println("  agent-deck session start my-project -m \"Explain this codebase\"")
+		fmt.Println("  agent-deck session start my-project --message-file task.md   # long prompt from file, no shell quoting")
+		fmt.Println("  git diff | agent-deck session start my-project --message-file -   # initial message from stdin")
 	}
 
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
@@ -193,7 +216,11 @@ func handleSessionStart(profile string, args []string) {
 	out := NewCLIOutput(*jsonOutput, quietMode)
 
 	// Merge message flags
-	initialMessage := mergeFlags(*message, *messageShort)
+	initialMessage, err := resolveMessageInput(mergeFlags(*message, *messageShort), *messageFile, os.Stdin)
+	if err != nil {
+		out.Error(err.Error(), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
 
 	// Load sessions
 	storage, instances, groups, err := loadSessionData(profile)
@@ -271,6 +298,27 @@ func handleSessionStart(profile string, args []string) {
 	if err := saveSessionData(storage, instances, groups); err != nil {
 		out.Error(fmt.Sprintf("failed to save session state: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
+	}
+
+	// --attach: drop the user into the freshly started session's pane. This
+	// suspends the CLI into tmux and blocks until the user detaches, so the
+	// normal success output below is skipped. Refused loudly (never silently)
+	// without an interactive terminal or under --json; the session stays
+	// started in both cases.
+	if *attach {
+		if *jsonOutput {
+			out.Error("--attach cannot be combined with --json; session was started", ErrCodeInvalidOperation)
+			os.Exit(3)
+		}
+		if err := attachInstanceInteractive(inst); err != nil {
+			if errors.Is(err, errAttachNoTTY) {
+				fmt.Fprintf(os.Stderr, "Error: %v; session was started\n", err)
+				os.Exit(3)
+			}
+			fmt.Fprintf(os.Stderr, "Error: failed to attach: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	// Output success
@@ -379,6 +427,194 @@ func handleSessionStop(profile string, args []string) {
 	out.Success(fmt.Sprintf("Stopped session: %s", inst.Title), result)
 }
 
+// handleSessionArchive stops a session and marks it archived so it is hidden
+// from active lists but retained in storage. Mirrors the TUI archive action
+// (home.go archiveSession) and WebMutator.ArchiveSession.
+func handleSessionArchive(profile string, args []string) {
+	fs := flag.NewFlagSet("session archive", flag.ExitOnError)
+	jsonOutput := fs.Bool("json", false, "Output as JSON")
+	quiet := fs.Bool("quiet", false, "Minimal output")
+	quietShort := fs.Bool("q", false, "Minimal output (short)")
+
+	fs.Usage = func() {
+		fmt.Println("Usage: agent-deck session archive <id|title> [options]")
+		fmt.Println()
+		fmt.Println("Stop a session and hide it from active lists (retained in storage).")
+		fmt.Println()
+		fmt.Println("Options:")
+		fs.PrintDefaults()
+	}
+
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
+		os.Exit(1)
+	}
+
+	identifier := fs.Arg(0)
+	quietMode := *quiet || *quietShort
+	out := NewCLIOutput(*jsonOutput, quietMode)
+
+	// An empty identifier is a usage error, not a missing session: exit 1 (not
+	// the ResolveSession NOT_FOUND exit 2, which is reserved for a genuinely
+	// unknown id/title).
+	if identifier == "" {
+		out.Error("session <id|title> required", ErrCodeInvalidOperation)
+		if !*jsonOutput {
+			fs.Usage()
+		}
+		os.Exit(1)
+	}
+
+	storage, instances, _, err := loadSessionData(profile)
+	if err != nil {
+		out.Error(err.Error(), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	inst, errMsg, errCode := ResolveSession(identifier, instances)
+	if inst == nil {
+		out.Error(errMsg, errCode)
+		if errCode == ErrCodeNotFound {
+			os.Exit(2)
+		}
+		os.Exit(1)
+		return // unreachable, satisfies staticcheck SA5011
+	}
+
+	if inst.IsArchived() {
+		out.Error(fmt.Sprintf("session '%s' is already archived", inst.Title), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+
+	// Only kill a live tmux session. Killing an already-dead session returns a
+	// fatal error that would abort the archive (see idempotent-Kill history),
+	// so gate on Exists() the way handleSessionStop does. Kill() sets
+	// Status=stopped in memory only; persistArchivedCLI persists it below.
+	//
+	// Unlike handleSessionStop we deliberately do NOT SyncSessionIDsFromTmux()
+	// here: archive persists via a targeted UPDATE (to survive concurrent TUI
+	// writers), which cannot carry the whole-row tool-id fields the sync
+	// populates. Late-discovered ids are dropped rather than saved via a
+	// non-targeted write that would reintroduce the archive-clobber race. The
+	// session's normal lifecycle already persists its tool ids.
+	killed := false
+	if inst.Exists() {
+		if err := inst.Kill(); err != nil {
+			out.Error(fmt.Sprintf("failed to stop session: %v", err), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		killed = true
+	}
+
+	inst.ArchivedAt = time.Now().UTC()
+	if err := persistArchivedCLI(storage, inst, killed); err != nil {
+		out.Error(fmt.Sprintf("failed to persist archive: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+
+	out.Success(fmt.Sprintf("Archived session: %s", inst.Title), map[string]interface{}{
+		"success":  true,
+		"id":       inst.ID,
+		"title":    inst.Title,
+		"archived": true,
+	})
+}
+
+// handleSessionUnarchive clears the archive flag without restarting tmux.
+// Mirrors the TUI unarchiveSession and WebMutator.UnarchiveSession.
+func handleSessionUnarchive(profile string, args []string) {
+	fs := flag.NewFlagSet("session unarchive", flag.ExitOnError)
+	jsonOutput := fs.Bool("json", false, "Output as JSON")
+	quiet := fs.Bool("quiet", false, "Minimal output")
+	quietShort := fs.Bool("q", false, "Minimal output (short)")
+
+	fs.Usage = func() {
+		fmt.Println("Usage: agent-deck session unarchive <id|title> [options]")
+		fmt.Println()
+		fmt.Println("Restore an archived session (does not restart its process).")
+		fmt.Println()
+		fmt.Println("Options:")
+		fs.PrintDefaults()
+	}
+
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
+		os.Exit(1)
+	}
+
+	identifier := fs.Arg(0)
+	quietMode := *quiet || *quietShort
+	out := NewCLIOutput(*jsonOutput, quietMode)
+
+	// Empty identifier is a usage error (exit 1), mirroring archive.
+	if identifier == "" {
+		out.Error("session <id|title> required", ErrCodeInvalidOperation)
+		if !*jsonOutput {
+			fs.Usage()
+		}
+		os.Exit(1)
+	}
+
+	storage, instances, _, err := loadSessionData(profile)
+	if err != nil {
+		out.Error(err.Error(), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
+	inst, errMsg, errCode := ResolveSession(identifier, instances)
+	if inst == nil {
+		out.Error(errMsg, errCode)
+		if errCode == ErrCodeNotFound {
+			os.Exit(2)
+		}
+		os.Exit(1)
+		return // unreachable, satisfies staticcheck SA5011
+	}
+
+	if !inst.IsArchived() {
+		out.Error(fmt.Sprintf("session '%s' is not archived", inst.Title), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+
+	// unarchive never kills tmux, so there is no post-kill status to persist.
+	inst.ArchivedAt = time.Time{}
+	if err := persistArchivedCLI(storage, inst, false); err != nil {
+		out.Error(fmt.Sprintf("failed to persist unarchive: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+
+	out.Success(fmt.Sprintf("Unarchived session: %s", inst.Title), map[string]interface{}{
+		"success":  true,
+		"id":       inst.ID,
+		"title":    inst.Title,
+		"archived": false,
+	})
+}
+
+// persistArchivedCLI writes the archive timestamp (and, when persistStatus is
+// set, the post-kill Status) via targeted UPDATEs. It deliberately avoids
+// saveSessionData: the full-save path has an external-change guard that aborts
+// and reloads under concurrent writers (a running TUI), which would silently
+// revert the archive. This mirrors home.go's persistArchived.
+//
+// persistStatus is true only when archive killed a live session: Kill() sets
+// Status=stopped in memory but writes nothing to the DB, so without this the
+// row keeps its pre-kill running/idle status and a later load misclassifies the
+// stopped session. PersistInstanceStatusesTx is the same targeted, abort-safe
+// primitive revive uses (single status column, no whole-row clobber).
+func persistArchivedCLI(storage *session.Storage, inst *session.Instance, persistStatus bool) error {
+	db := storage.GetDB()
+	if db == nil {
+		return fmt.Errorf("state database unavailable")
+	}
+	if persistStatus {
+		if err := db.PersistInstanceStatusesTx([]statedb.InstanceStatusUpdate{
+			{ID: inst.ID, Status: string(inst.Status)},
+		}); err != nil {
+			return err
+		}
+	}
+	return db.SetArchived(inst.ID, inst.ArchivedAt)
+}
+
 // drainGroupQueue starts the oldest queued instance in groupPath when a slot
 // is available. Returns the drained instance (or nil if nothing to drain).
 // The caller is responsible for persisting state afterward.
@@ -409,6 +645,8 @@ func handleSessionRestart(profile string, args []string) {
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
 	force := fs.Bool("force", false, "Restart even if the session is already healthy and fresh (bypasses issue #30 guard)")
 	all := fs.Bool("all", false, "Restart all active sessions")
+	envFlags := make(envVarFlags)
+	fs.Var(&envFlags, "env", "Environment variable in KEY=VALUE format for the restarted process (can be repeated)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck session restart [id|title] [options]")
@@ -420,11 +658,22 @@ func handleSessionRestart(profile string, args []string) {
 		fmt.Println("60 seconds. This prevents watchdog double-fires from destroying a")
 		fmt.Println("just-created tmux scope (issue #30). Use --force to restart anyway.")
 		fmt.Println()
+		fmt.Println("A restart is also skipped when the session's agent could not authenticate")
+		fmt.Println("(401 / invalid credentials): a restart cannot fix a credential, and each")
+		fmt.Println("attempt races the rotating token shared by every session on this host.")
+		fmt.Println("Re-authenticate (run /login), then restart — --force overrides the hold.")
+		fmt.Println()
+		fmt.Println("--all paces restarts with a jittered stagger, caps how many un-verified")
+		fmt.Println("boots run at once, skips auth-held sessions, and STOPS early if several")
+		fmt.Println("restarts in a row die on authentication (reported as auth_tripped).")
+		fmt.Println()
 		fmt.Println("Options:")
 		fs.PrintDefaults()
 		fmt.Println()
 		fmt.Println("Examples:")
 		fmt.Println("  agent-deck session restart my-project")
+		fmt.Println("  agent-deck session restart my-project --env API_URL=https://api.example.com")
+		fmt.Println("  agent-deck session restart my-project --env FOO=one --env BAR=two")
 		fmt.Println("  agent-deck session restart --all")
 	}
 
@@ -443,7 +692,7 @@ func handleSessionRestart(profile string, args []string) {
 	}
 
 	if *all {
-		restartAllSessions(out, storage, instances, groups)
+		restartAllSessions(out, storage, instances, groups, envFlags)
 		return
 	}
 
@@ -469,7 +718,7 @@ func handleSessionRestart(profile string, args []string) {
 	// scope intact) when the session is healthy and was started very
 	// recently. A watchdog racing `start` → `restart` on the same session
 	// must not tear down the fresh scope.
-	if skip, reason := session.ShouldSkipRestart(inst, time.Now(), *force); skip {
+	if skip, reason := session.ShouldSkipRestart(inst, time.Now(), *force || len(envFlags) > 0); skip {
 		data := map[string]interface{}{
 			"success": true,
 			"skipped": true,
@@ -482,7 +731,7 @@ func handleSessionRestart(profile string, args []string) {
 	}
 
 	// Restart the session
-	if err := inst.Restart(); err != nil {
+	if err := inst.RestartWithEnv(envFlags); err != nil {
 		out.Error(fmt.Sprintf("failed to restart session: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
@@ -517,8 +766,17 @@ func handleSessionRestart(profile string, args []string) {
 	out.Success(fmt.Sprintf("Restarted session: %s", inst.Title), data)
 }
 
-// restartAllSessions restarts every active session one by one.
-func restartAllSessions(out *CLIOutput, storage *session.Storage, instances []*session.Instance, groups []*session.GroupData) {
+// restartAllSessions restarts every active session, paced and gated by
+// session.BootSweep.
+//
+// This is the path that turned an expired token into a fleet outage on
+// 2026-07-26: it used to boot every session back-to-back with no brake, so
+// during a credential failure it both wasted every restart AND had every fresh
+// agent race the single rotating refresh token. The sweep now skips sessions
+// already held for auth, staggers boots with jitter, caps how many unverified
+// boots contend for the token at once, and stops entirely after a few
+// consecutive auth-deaths with one loud message instead of burning the fleet.
+func restartAllSessions(out *CLIOutput, storage *session.Storage, instances []*session.Instance, groups []*session.GroupData, env map[string]string) {
 	var active []*session.Instance
 	for _, inst := range instances {
 		if inst.Exists() {
@@ -531,29 +789,28 @@ func restartAllSessions(out *CLIOutput, storage *session.Storage, instances []*s
 		os.Exit(1)
 	}
 
-	var results []map[string]interface{}
-	var failed int
+	results := make(map[string]map[string]interface{}, len(active))
 
-	for _, inst := range active {
+	sweep := session.NewBootSweep()
+	sweepResult := sweep.Run(active, func(inst *session.Instance) error {
 		result := map[string]interface{}{
 			"id":    inst.ID,
 			"title": inst.Title,
 		}
+		results[inst.ID] = result
 
 		if !out.jsonMode {
 			fmt.Printf("Restarting %s...\n", inst.Title)
 		}
 
-		if err := inst.Restart(); err != nil {
+		if err := inst.RestartWithEnv(env); err != nil {
 			errMsg := fmt.Sprintf("failed to restart session '%s': %v", inst.Title, err)
 			if !out.jsonMode {
 				fmt.Fprintf(os.Stderr, "  Error: %s\n", errMsg)
 			}
 			result["success"] = false
 			result["error"] = errMsg
-			failed++
-			results = append(results, result)
-			continue
+			return err
 		}
 		inst.LastStartedAt = time.Now()
 
@@ -571,10 +828,17 @@ func restartAllSessions(out *CLIOutput, storage *session.Storage, instances []*s
 		if warning != "" {
 			result["warning"] = warning
 		}
-		results = append(results, result)
 
 		if !out.jsonMode {
 			fmt.Printf("  Done: %s\n", inst.Title)
+		}
+		return nil
+	})
+
+	ordered := restartAllSessionRecords(results, sweepResult.Attempts)
+	for _, attempt := range sweepResult.Attempts {
+		if attempt.Skipped && !out.jsonMode && !out.quietMode {
+			fmt.Printf("Skipped %s: %s\n", attempt.Title, attempt.SkipReason)
 		}
 	}
 
@@ -584,23 +848,27 @@ func restartAllSessions(out *CLIOutput, storage *session.Storage, instances []*s
 		os.Exit(1)
 	}
 
+	if sweepResult.TripMessage != "" && !out.jsonMode {
+		fmt.Fprintf(os.Stderr, "\n🔒 %s\n", sweepResult.TripMessage)
+	}
+
 	if out.jsonMode {
-		out.Success("", map[string]interface{}{
-			"success":   failed == 0,
-			"total":     len(active),
-			"restarted": len(active) - failed,
-			"failed":    failed,
-			"sessions":  results,
-		})
+		out.Success("", restartAllSessionsJSONPayload(len(active), sweepResult, ordered))
 	} else if !out.quietMode {
-		fmt.Printf("Restarted %d/%d sessions", len(active)-failed, len(active))
-		if failed > 0 {
-			fmt.Printf(" (%d failed)", failed)
+		fmt.Printf("Restarted %d/%d sessions", sweepResult.Booted, len(active))
+		if sweepResult.Failed > 0 {
+			fmt.Printf(" (%d failed)", sweepResult.Failed)
+		}
+		if sweepResult.SkippedHeld > 0 {
+			fmt.Printf(" (%d held for auth)", sweepResult.SkippedHeld)
+		}
+		if sweepResult.Abandoned > 0 {
+			fmt.Printf(" (%d abandoned after auth circuit tripped)", sweepResult.Abandoned)
 		}
 		fmt.Println()
 	}
 
-	if failed > 0 {
+	if restartAllSessionsExitCode(sweepResult) != 0 {
 		os.Exit(1)
 	}
 }
@@ -879,7 +1147,10 @@ func handleSessionFork(profile string, args []string) {
 					os.Exit(1)
 				}
 
-				createdBranch, cwErr := git.CreateWorktreeAtStartPoint(repoRoot, worktreePath, wtBranch, parentHead)
+				// #1708: inherit the PARENT SESSION's sparse state (its own
+				// worktree), not repoRoot's — see git.CaptureSparseCheckout.
+				createdBranch, cwErr := git.CreateWorktreeAtStartPointWithOptions(repoRoot, worktreePath, wtBranch, parentHead,
+					git.SparseInheritOptions(wtSettings.InheritSparseCheckout(), inst.ProjectPath))
 				if cwErr != nil {
 					out.Error(fmt.Sprintf("worktree creation failed: %v", cwErr), ErrCodeInvalidOperation)
 					os.Exit(1)
@@ -948,9 +1219,10 @@ func handleSessionFork(profile string, args []string) {
 			} else if backend.Type() == vcs.TypeGit {
 				// Non-with-state git path: upstream's combined wrapper unchanged.
 				var cwErr error
-				setupErr, cwErr = git.CreateWorktreeWithStateAndSetup(
+				setupErr, cwErr = git.CreateWorktreeWithSetupOptions(
 					repoRoot, worktreePath, wtBranch,
 					git.WorktreeStateOptions{},
+					git.SparseInheritOptions(wtSettings.InheritSparseCheckout(), inst.ProjectPath),
 					os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
 				if cwErr != nil {
 					out.Error(fmt.Sprintf("worktree creation failed: %v", cwErr), ErrCodeInvalidOperation)
@@ -1102,6 +1374,196 @@ func handleSessionAttach(profile string, args []string) {
 	}
 }
 
+// errFocusNotFound signals that `session focus` was given an id absent from the
+// current profile. Callers map it to a distinct (exit 2) "not found" code.
+var errFocusNotFound = errors.New("session not found")
+
+// liveSwitcher attempts to move the attached terminal straight into a session's
+// tmux pane (the Ctrl+b N quick-switch path), so a notification click lands you
+// in the session even while the TUI is paused inside another attach. Injected
+// into routeFocus so the attached-vs-list routing is unit-testable without a
+// real tmux server.
+type liveSwitcher interface {
+	// switchInto moves the client attached to inst's tmux server into inst's
+	// pane. Returns switched=true iff a client was attached and moved; false
+	// (no error) when inst has no live pane or no client is attached on its
+	// socket, signalling the caller to fall back to a focus_request row.
+	switchInto(inst *session.Instance) (bool, error)
+}
+
+// tmuxLiveSwitcher is the production liveSwitcher. It mirrors the Ctrl+b N
+// quick-switch: tmux switch-client + an ack-signal write, both of which work
+// while the Bubble Tea TUI is suspended during tea.Exec.
+type tmuxLiveSwitcher struct{}
+
+func (tmuxLiveSwitcher) switchInto(inst *session.Instance) (bool, error) {
+	if inst == nil || !inst.Exists() {
+		return false, nil
+	}
+	ts := inst.GetTmuxSession()
+	if ts == nil || ts.Name == "" {
+		return false, nil
+	}
+	// Query/switch on the target's own socket: switch-client only works when the
+	// attached client and the target session share a tmux server, so a client on
+	// a different socket simply yields switched=false and the focus_request
+	// fallback takes over (matches the Ctrl+b N same-server limitation).
+	return tmux.SwitchAttachedClients(inst.TmuxSocketName, ts.Name, inst.ID)
+}
+
+// clientDetacher detaches the user's currently-attached tmux client when the
+// live switch could not move it. switch-client cannot cross tmux servers, so a
+// notification target on a different socket than the attached session yields
+// switched=false; detaching that client makes the paused TUI resume and consume
+// the focus_request (attaching the target on its own socket) instead of the
+// switch silently waiting for a manual Ctrl+Q. Injected into routeFocus so the
+// cross-socket routing is unit-testable without a real tmux server.
+type clientDetacher interface {
+	// detachClientsOn detaches every real (non-control) client attached on any
+	// of sockets. Returns detached=true iff at least one client was detached.
+	detachClientsOn(sockets []string) (bool, error)
+}
+
+// tmuxClientDetacher is the production clientDetacher.
+type tmuxClientDetacher struct{}
+
+func (tmuxClientDetacher) detachClientsOn(sockets []string) (bool, error) {
+	return tmux.DetachClientsOnSockets(sockets...)
+}
+
+// findFocusInstance returns the instance with the given id, or nil.
+func findFocusInstance(instances []*session.Instance, id string) *session.Instance {
+	for _, inst := range instances {
+		if inst.ID == id {
+			return inst
+		}
+	}
+	return nil
+}
+
+// focusOtherSockets returns the distinct tmux socket names used by instances,
+// excluding exclude (the target's own socket, where the live switch already
+// looked). Order-preserving and deduped. These are the sockets that may host
+// the user's currently-attached client when the target lives elsewhere.
+func focusOtherSockets(instances []*session.Instance, exclude string) []string {
+	seen := map[string]bool{exclude: true}
+	var out []string
+	for _, inst := range instances {
+		s := inst.TmuxSocketName
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+// routeFocus drives `session focus <id>`. With --attach it first tries a live
+// switch-while-attached (so the click lands you straight in the session even
+// when the TUI is paused inside another attach); if no client is attached to the
+// target's tmux server it falls back to the foreground focus_request row, which
+// the TUI consumes on its next tick. Without --attach it always writes the
+// (select-only) focus_request. Split out of handleSessionFocus so it is
+// unit-testable without os.Exit; switcher is injected for the same reason.
+func routeFocus(db *statedb.StateDB, instances []*session.Instance, id string, nowNano int64, attach bool, switcher liveSwitcher, detacher clientDetacher) error {
+	if id == "" {
+		return fmt.Errorf("session focus requires an <id>")
+	}
+	inst := findFocusInstance(instances, id)
+	if inst == nil {
+		return fmt.Errorf("%w: %q", errFocusNotFound, id)
+	}
+	if attach && switcher != nil {
+		// The contract reserves (false, nil) for the benign fallback (no live
+		// pane / no client attached on the socket); a non-nil error is a real
+		// tmux failure that must surface, not be silently swallowed into the
+		// fallback path.
+		switched, err := switcher.switchInto(inst)
+		if err != nil {
+			return err
+		}
+		if switched {
+			return nil
+		}
+		// Live switch couldn't move the client: it's attached to a different tmux
+		// server than the target (switch-client can't cross servers). Write the
+		// focus_request FIRST, then detach that client so agent-deck's paused
+		// attach returns and the resumed TUI consumes the row on its next tick —
+		// attaching the target on its own socket, instead of waiting for a manual
+		// Ctrl+Q. When no client is attached elsewhere (e.g. the TUI is already in
+		// the list view), the detach is a harmless no-op and the row is consumed
+		// normally.
+		if detacher != nil {
+			if err := session.WriteFocusRequestAttach(db, id, nowNano, attach); err != nil {
+				return err
+			}
+			// The focus_request is already persisted, so a detach failure still
+			// leaves the row to be consumed on the next tick — but surface it so
+			// the immediate-switch path's failure isn't hidden.
+			if _, err := detacher.detachClientsOn(focusOtherSockets(instances, inst.TmuxSocketName)); err != nil {
+				return err
+			}
+			return nil
+		}
+	}
+	return session.WriteFocusRequestAttach(db, id, nowNano, attach)
+}
+
+// resolveAndWriteFocus validates id against the loaded instances and, on a
+// match, writes the focus_request row. Retained as the switcher-less path
+// (select-only / no live switch); delegates to routeFocus.
+func resolveAndWriteFocus(db *statedb.StateDB, instances []*session.Instance, id string, nowNano int64, attach bool) error {
+	return routeFocus(db, instances, id, nowNano, attach, nil, nil)
+}
+
+// handleSessionFocus signals the running TUI (same profile) to select <id> on
+// its next poll. Fire-and-forget: no stdout on success. Unknown id exits 2.
+// With --attach, the TUI opens/attaches the session instead of only selecting it.
+func handleSessionFocus(profile string, args []string) {
+	fs := flag.NewFlagSet("session focus", flag.ExitOnError)
+	attach := fs.Bool("attach", false, "Open/attach the session, not just select it")
+	fs.Usage = func() {
+		fmt.Println("Usage: agent-deck session focus <id> [--attach]")
+		fmt.Println()
+		fmt.Println("Signal the running agent-deck TUI (same profile) to reveal and")
+		fmt.Println("select the session with the given instance id on its next refresh.")
+		fmt.Println("With --attach, the TUI opens/attaches the session (as if you")
+		fmt.Println("pressed Enter on it) instead of only moving the cursor.")
+	}
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
+		os.Exit(1)
+	}
+
+	id := fs.Arg(0)
+
+	storage, instances, _, err := loadSessionData(profile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	db := storage.GetDB()
+	if db == nil {
+		fmt.Fprintln(os.Stderr, "Error: no state database available")
+		os.Exit(1)
+	}
+
+	var switcher liveSwitcher
+	var detacher clientDetacher
+	if *attach {
+		switcher = tmuxLiveSwitcher{}
+		detacher = tmuxClientDetacher{}
+	}
+	if err := routeFocus(db, instances, id, time.Now().UnixNano(), *attach, switcher, detacher); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		if errors.Is(err, errFocusNotFound) {
+			os.Exit(2)
+		}
+		os.Exit(1)
+	}
+}
+
 // handleSessionShow shows session details
 func handleSessionShow(profile string, args []string) {
 	fs := flag.NewFlagSet("session show", flag.ExitOnError)
@@ -1198,6 +1660,7 @@ func handleSessionShow(profile string, args []string) {
 	}
 	modelInfo := inst.LaunchModelInfo()
 	addModelInfoJSON(jsonData, modelInfo)
+	addAutoNameJSON(jsonData, inst)
 
 	if inst.Command != "" {
 		jsonData["command"] = inst.Command
@@ -1240,6 +1703,33 @@ func handleSessionShow(profile string, args []string) {
 
 	if tmuxSession := inst.GetTmuxSession(); tmuxSession != nil {
 		jsonData["tmux_session"] = tmuxSession.Name
+	}
+
+	// #1580: surface a spawn-failure diagnostic when the session errored at
+	// startup (bare "error" with no pane). Include the structured record in
+	// --json so tooling can read it too.
+	spawnFailure := inst.SpawnFailure()
+	if spawnFailure != nil {
+		jsonData["spawn_failure"] = map[string]interface{}{
+			"reason":       spawnFailure.Reason,
+			"command":      spawnFailure.Command,
+			"dying_output": spawnFailure.DyingOutput,
+			"elapsed_ms":   spawnFailure.ElapsedMs,
+			"ts":           spawnFailure.Timestamp,
+		}
+	}
+
+	// An auth hold explains a bare "error" that no restart can clear, and tells
+	// automation (conductors, watchdogs reading --json) to stop retrying.
+	authHold := inst.AuthHold()
+	if authHold != nil {
+		jsonData["auth_hold"] = map[string]interface{}{
+			"reason":        authHold.Reason,
+			"remedy":        authHold.Remedy(),
+			"evidence":      authHold.Evidence,
+			"boot_attempts": authHold.BootAttempts,
+			"ts":            authHold.Timestamp,
+		}
 	}
 
 	// Build human-readable output
@@ -1329,6 +1819,21 @@ func handleSessionShow(profile string, args []string) {
 		if tmuxSession != nil {
 			sb.WriteString(fmt.Sprintf("Tmux:    %s\n", tmuxSession.Name))
 		}
+	}
+
+	// #1580: print the spawn-failure block so `session show` on an errored
+	// session explains why it died instead of leaving the user with a bare
+	// "error".
+	if spawnFailure != nil {
+		sb.WriteString("\n")
+		sb.WriteString(spawnFailure.FormatForDisplay())
+	}
+
+	// The auth block goes LAST so it is the final thing on screen: it is the only
+	// one of these diagnostics that names an action the user must take.
+	if authHold != nil {
+		sb.WriteString("\n")
+		sb.WriteString(authHold.FormatForDisplay())
 	}
 
 	out.Print(sb.String(), jsonData)
@@ -1440,6 +1945,11 @@ func handleSessionSet(profile string, args []string) {
 		os.Exit(1)
 		return // unreachable, satisfies staticcheck SA5011
 	}
+	// #1706: SetField canonicalizes a project path (expand + absolutize), so
+	// report what was actually stored rather than the raw argument.
+	if field == session.FieldPath {
+		value = inst.ProjectPath
+	}
 	// CLI holds no lock — run tmux side effects inline. TUI defers them
 	// until after instancesMu.Unlock.
 	if postCommit != nil {
@@ -1543,9 +2053,8 @@ func findSessionByTmuxAcrossProfiles() (*session.Instance, string) {
 
 // findSessionByTmux tries to find a session by matching tmux session name or working directory
 func findSessionByTmux(instances []*session.Instance) *session.Instance {
-	// Get current tmux session name
-	cmd := exec.Command("tmux", "display-message", "-p", "#{session_name}\t#{pane_current_path}")
-	output, err := cmd.Output()
+	// Get current tmux session name (bounded — see tmuxProbeTimeout)
+	output, err := tmuxProbeBounded("display-message", "-p", "#{session_name}\t#{pane_current_path}")
 	if err != nil {
 		return nil
 	}
@@ -1599,10 +2108,9 @@ func findSessionByTmux(instances []*session.Instance) *session.Instance {
 
 // showTmuxSessionInfo shows information about the current tmux session (unregistered)
 func showTmuxSessionInfo(out *CLIOutput, jsonOutput bool) {
-	// Get tmux session info
-	cmd := exec.Command("tmux", "display-message", "-p",
+	// Get tmux session info (bounded — see tmuxProbeTimeout)
+	output, err := tmuxProbeBounded("display-message", "-p",
 		"#{session_name}\t#{pane_current_path}\t#{session_created}\t#{window_name}")
-	output, err := cmd.Output()
 	if err != nil {
 		out.Error("failed to get tmux session info", ErrCodeNotFound)
 		os.Exit(1)
@@ -2084,6 +2592,44 @@ func handleSessionSetTitleLock(profile string, args []string) {
 	})
 }
 
+// fetchHookDrivenStatus reloads the target from storage and reports the same
+// hook-driven status string that `agent-deck list --json` shows. `session send
+// --defer-if-busy` polls this so its hold gate keys off the turn-finished
+// Stop-hook signal (a true edge) rather than WaitForAgentReady's pane-diff
+// readiness heuristic, which false-positives to idle during tool calls and
+// thinking pauses (#1578).
+//
+// It mirrors handleList's status pipeline exactly: reload -> warm caches +
+// cold-load hook files via RefreshInstancesForCLIStatus -> UpdateStatus. The
+// reload each poll is deliberate: a fresh OS process has no StatusFileWatcher,
+// so the only way to observe the target's newest hook edge is to re-read it
+// from disk.
+func fetchHookDrivenStatus(profile, sessionRef string) (string, error) {
+	_, instances, _, err := loadSessionData(profile)
+	if err != nil {
+		return "", err
+	}
+	inst, errMsg, _ := ResolveSession(sessionRef, instances)
+	if inst == nil {
+		return "", fmt.Errorf("%s", errMsg)
+	}
+	// Cold-load the on-disk hook file into the instance — a fresh CLI process
+	// has no StatusFileWatcher, so the target's newest hook edge only reaches us
+	// by re-reading it from disk each poll.
+	session.RefreshInstancesForCLIStatus([]*session.Instance{inst})
+	// Prefer the FRESH hook-driven signal. It is the true turn-finished edge
+	// (Claude's UserPromptSubmit hook -> "running", Stop hook -> "waiting") and,
+	// unlike UpdateStatus, is not gated on a live tmux handle — exactly the
+	// property #1578 needs so the hold gate keys off "turn finished" rather than
+	// a pane-diff heuristic. Fall back to the full list --json pipeline when no
+	// fresh hook signal exists (non-hook tools, or a stale/absent hook file).
+	if hs, fresh := inst.GetHookStatus(); fresh && hs != "" {
+		return hs, nil
+	}
+	_ = inst.UpdateStatus()
+	return StatusString(inst.Status), nil
+}
+
 // handleSessionSend sends a message to a running session
 // Waits for the agent to be ready before sending (Claude, Gemini, etc.)
 func handleSessionSend(profile string, args []string) {
@@ -2095,6 +2641,9 @@ func handleSessionSend(profile string, args []string) {
 	wait := fs.Bool("wait", false, "Block until agent finishes processing, then print output")
 	stream := fs.Bool("stream", false, "Stream JSONL events (Claude only) to stdout instead of returning a snapshot")
 	draft := fs.Bool("draft", false, "Pre-fill the prompt without submitting (incompatible with --wait/--stream/--no-wait)")
+	messageFile := fs.String("message-file", "", "Read the message from a file ('-' for stdin) instead of a positional argument; avoids shell quoting of long prompts")
+	deferIfBusy := fs.Bool("defer-if-busy", false, "Hold delivery until the target is idle (turn-finished, hook-driven) instead of interrupting a mid-generation turn (incompatible with --no-wait)")
+	deferTimeout := fs.Duration("defer-timeout", 30*time.Minute, "Max time --defer-if-busy holds a busy target before dropping the message with a non-zero exit")
 	timeout := fs.Duration("timeout", 10*time.Minute, "Max time to wait for the agent to become ready and (with --wait) to finish processing")
 	streamIdle := fs.Duration("stream-idle", 10*time.Second, "Max idle time before --stream aborts with error")
 	streamCharBudget := fs.Int("stream-char-budget", 4000, "Char budget for text flush in --stream mode")
@@ -2114,6 +2663,9 @@ func handleSessionSend(profile string, args []string) {
 		fmt.Println("  agent-deck session send my-project \"quick ping\" --no-wait")
 		fmt.Println("  agent-deck session send my-project \"trace progress\" --stream")
 		fmt.Println("  agent-deck session send my-project \"cwd: /path/to/dir\" --draft")
+		fmt.Println("  agent-deck session send my-project --message-file answer.md   # long reply from file")
+		fmt.Println("  git diff | agent-deck session send my-project --message-file -   # message from stdin")
+		fmt.Println("  agent-deck session send parent \"child done\" --defer-if-busy --defer-timeout 30m")
 	}
 
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
@@ -2123,9 +2675,10 @@ func handleSessionSend(profile string, args []string) {
 
 	out := NewCLIOutput(*jsonOutput, *quiet)
 
-	if len(remaining) < 2 {
+	needPositionalMessage := *messageFile == ""
+	if len(remaining) < 1 || (needPositionalMessage && len(remaining) < 2) {
 		fs.Usage()
-		out.Error("session and message are required", ErrCodeInvalidOperation)
+		out.Error("session and message (or --message-file) are required", ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
 
@@ -2139,8 +2692,19 @@ func handleSessionSend(profile string, args []string) {
 		os.Exit(1)
 	}
 
+	// #1578: --defer-if-busy holds delivery until the target is turn-finished;
+	// --no-wait fires immediately. They are opposites.
+	if *deferIfBusy && *noWait {
+		out.Error("--defer-if-busy is incompatible with --no-wait", ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+
 	sessionRef := remaining[0]
-	message := strings.Join(remaining[1:], " ")
+	message, err := resolveMessageInput(strings.Join(remaining[1:], " "), *messageFile, os.Stdin)
+	if err != nil {
+		out.Error(err.Error(), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
 
 	// Load sessions
 	_, instances, _, err := loadSessionData(profile)
@@ -2191,6 +2755,20 @@ func handleSessionSend(profile string, args []string) {
 	if tmuxSess == nil {
 		out.Error("could not determine tmux session", ErrCodeInvalidOperation)
 		os.Exit(1)
+	}
+
+	// #1578: --defer-if-busy holds delivery until the target is turn-finished.
+	// Runs BEFORE WaitForAgentReady + the composer-draft Ctrl+C guard, so a
+	// mid-generation target is never interrupted. Keys off the hook-driven
+	// status (the same turn-finished signal `list --json` reports), not the
+	// pane-diff readiness heuristic that false-positives idle mid-turn.
+	if *deferIfBusy {
+		if err := send.WaitUntilNotBusy(func() (string, error) {
+			return fetchHookDrivenStatus(profile, sessionRef)
+		}, *deferTimeout, send.DeferPollInterval, time.Sleep); err != nil {
+			out.Error(err.Error(), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
 	}
 
 	// Wait for agent to be ready (unless --no-wait is specified).
@@ -2258,9 +2836,19 @@ func handleSessionSend(profile string, args []string) {
 		extra := sendRes.jsonFields()
 		extra["session_id"] = inst.ID
 		extra["session_title"] = inst.Title
-		if sendRes.delivery == deliveryTypedNotSubmitted {
+		switch sendRes.delivery {
+		case deliveryTypedNotSubmitted:
 			out.ErrorWithData(fmt.Sprintf("message typed but not submitted to '%s': %v", inst.Title, sendErr), ErrCodeDeliveryFailed, extra)
-		} else {
+		case deliveryLineTooLong:
+			// Nothing was typed, so the composer is exactly as the operator
+			// left it. Retrying the same body is pointless; the actionable
+			// advice is to break the line or send a file reference.
+			out.ErrorWithData(fmt.Sprintf("message too long for '%s' to receive as one line: %v", inst.Title, sendErr), ErrCodeDeliveryFailed, extra)
+		case deliveryTyped:
+			out.ErrorWithData(fmt.Sprintf("message reached '%s' but was never confirmed submitted: %v", inst.Title, sendErr), ErrCodeDeliveryFailed, extra)
+		case deliveryNoEvidence:
+			out.ErrorWithData(fmt.Sprintf("message not delivered to '%s': %v", inst.Title, sendErr), ErrCodeDeliveryFailed, extra)
+		default:
 			out.ErrorWithData(fmt.Sprintf("failed to send message: %v", sendErr), ErrCodeInvalidOperation, extra)
 		}
 		os.Exit(1)
@@ -2329,6 +2917,9 @@ func handleSessionSend(profile string, args []string) {
 		if session.IsClaudeCompatible(inst.Tool) {
 			if freshID := inst.GetSessionIDFromTmux(); freshID != "" {
 				inst.ClaudeSessionID = freshID
+				// #1815: own pane env — weak vouch (see
+				// NoteClaudeSessionIDFromOwnPane).
+				session.NoteClaudeSessionIDFromOwnPane(inst)
 				inst.ClaudeDetectedAt = time.Now()
 			}
 		}
@@ -2405,10 +2996,28 @@ const (
 	// deliverySubmitted: positive evidence the agent accepted the message
 	// (an "active" transition, or the composer cleared after holding it).
 	deliverySubmitted = "submitted"
-	// deliveryUnverified: the message was sent but this tool's TUI exposes
-	// no Claude-shaped verification signals, so submission is unverified
-	// (non-Claude tools; legacy best-effort contract).
+	// deliveryUnverified: the message was sent but neither Claude-shaped
+	// submission signals nor a content-arrival check could reach a verdict,
+	// so submission is genuinely unknown. Since issue #1793 this is the
+	// narrow "we could not tell" bucket, not the catch-all it used to be:
+	// a send only lands here when the payload is small enough that the
+	// canonical-overflow failure mode cannot apply and it carries no token
+	// distinctive enough to look for in the pane.
 	deliveryUnverified = "unverified"
+	// deliveryTyped: the message body was observed reaching the target pane,
+	// but nothing proved the agent accepted it as a turn. Content sitting in
+	// a composer is not an accepted turn, and calling it one is how issue
+	// #1793 happened in the first place — so this is a FAILURE: nonzero exit,
+	// `"success": false`, `"submitted": false`. It is distinct from
+	// deliveryTypedNotSubmitted, which is the stronger claim that the
+	// composer was still positively holding the message at the end of the
+	// bounded Enter retries.
+	deliveryTyped = "typed"
+	// deliveryLineTooLong: refused before typing anything because the pane's
+	// reader is in canonical mode and a payload line exceeds its line buffer
+	// (issue #1793). The kernel would discard the overflow and the
+	// submitting Enter with it, so this can never be reported as success.
+	deliveryLineTooLong = "line_too_long"
 	// deliveryTypedNotSubmitted: the message body is still sitting unsent in
 	// the composer after the bounded Enter-retry budget (issue #1413).
 	deliveryTypedNotSubmitted = "typed_not_submitted"
@@ -2448,6 +3057,11 @@ func (r sendDeliveryResult) jsonFields() map[string]interface{} {
 	fields := map[string]interface{}{}
 	if r.delivery != "" {
 		fields["delivery"] = r.delivery
+		// Explicit, machine-checkable: a caller must not have to know which
+		// delivery strings imply an accepted turn. Only deliverySubmitted
+		// does; `typed` in particular means the bytes arrived and nothing
+		// confirmed the agent took them up (issue #1793).
+		fields["submitted"] = r.delivery == deliverySubmitted
 	}
 	if ms := r.held.Milliseconds(); ms > 0 {
 		fields["held_for_composer_ms"] = ms
@@ -2553,6 +3167,11 @@ func executeSend(target sendRetryTarget, tool, message string, noWait bool, tun 
 		res.held = guard.Held
 		res.draftSaved = guard.SavedDraft
 		res.draftCleared = guard.DraftCleared
+		// Provenance for the #1777 attribution gate, taken from the capture
+		// the guard already made just before we type: with no paste marker
+		// parked in the composer then, a marker seen during verification is
+		// the collapsed form of our own payload and may be nudged.
+		tun.retry.composerPasteFreeBeforeSend = guard.ComposerPasteMarkerFree
 	}
 
 	delivery, err := sendWithRetryTarget(target, message, skipClaudeDeliveryVerify(tool), tun.retry)
@@ -2696,6 +3315,27 @@ type sendRetryOptions struct {
 	// error instead of the prior best-effort `nil`. Closes the silent-drop
 	// path reported in issue #876.
 	verifyDelivery bool
+
+	// composerPasteFreeBeforeSend is the pre-send provenance evidence for the
+	// #1777 attribution gate: the caller positively observed, immediately
+	// before this send, a composer holding no "[Pasted text …]" marker. Only
+	// then can a marker seen during the verify loop be attributed to the
+	// collapse of our own payload and receive an Enter nudge. Left false, a
+	// composer paste marker counts as foreign content and no nudge fires —
+	// the fail-safe default for callers that cannot establish provenance.
+	composerPasteFreeBeforeSend bool
+}
+
+// composerPasteFree captures the pane and reports whether the composer is
+// currently free of a "[Pasted text …]" marker — the pre-send provenance
+// probe for sendRetryOptions.composerPasteFreeBeforeSend (issue #1777). A
+// capture failure returns false (fail safe: no evidence, no attribution).
+func composerPasteFree(target sendRetryTarget) bool {
+	raw, err := target.CapturePaneFresh()
+	if err != nil {
+		return false
+	}
+	return !send.ComposerHoldsPasteMarker(raw, tmux.StripANSI)
 }
 
 // sendWithRetryTarget sends the message and runs the bounded submit
@@ -2710,12 +3350,42 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 		opts.checkDelay = 0
 	}
 
+	// Baseline for the arrival check below, taken BEFORE the send. Neither
+	// signal the check uses means anything as a snapshot — only as a change:
+	//
+	//   - "the body is on screen": re-sending an identical message (a
+	//     heartbeat, an inbox nudge, a retry) would match the previous copy
+	//     still sitting in the pane and certify a send that vanished.
+	//   - "the agent is active": a pane that was ALREADY busy is still busy a
+	//     moment later whether or not it received anything.
+	//
+	// Both would hand back a success for a message that never arrived, which
+	// is the exact phantom this is here to kill. Only a transition away from
+	// this baseline counts. Costs one pane capture plus one status read, and
+	// only on the path that needs them.
+	var arrivalBaseline sendArrivalBaseline
+	if skipVerify {
+		arrivalBaseline = captureArrivalBaseline(target, message)
+	}
+
 	if err := target.SendKeysAndEnter(message); err != nil {
+		// A refused over-long line is a distinct, actionable outcome: the
+		// transport typed nothing, so the composer is untouched and the
+		// caller must not retry the same body against the same pane
+		// (issue #1793).
+		if errors.Is(err, tmux.ErrCanonicalLineOverflow) {
+			return deliveryLineTooLong, fmt.Errorf("message not delivered: %w", err)
+		}
 		return deliverySendFailed, fmt.Errorf("failed to send message: %w", err)
 	}
 
 	if skipVerify {
-		return deliveryUnverified, nil
+		// Issue #1793: "the tmux command returned" is not delivery. This
+		// path used to return success on transport alone, which is exactly
+		// how a 4095-byte payload that never reached the agent was reported
+		// as `{"success":true,"delivery":"unverified"}`. Confirm the body
+		// actually reached the pane before claiming anything.
+		return verifyContentArrival(target, message, opts, arrivalBaseline)
 	}
 
 	// Verify the agent accepted Enter and began processing.
@@ -2748,23 +3418,51 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 	fullResendCount := 0
 	// sawDeliveryEvidence flips true on any positive signal that the message
 	// reached the agent: an "active" status transition, an unsent-prompt
-	// composer marker, the message body appearing verbatim in the pane, or a
-	// successful full resend. When opts.verifyDelivery is set and this stays
-	// false for the entire budget, the function returns an error instead of
-	// silently succeeding (issue #876).
+	// composer marker, or the message body appearing verbatim in the pane.
+	// When opts.verifyDelivery is set and this stays false for the entire
+	// budget, the function returns an error instead of silently succeeding
+	// (issue #876).
+	//
+	// ARRIVAL IS NOT SUBMISSION. Two of those three signals — body text in the
+	// pane, and an unsent-prompt marker — say the bytes got there and say
+	// nothing about the agent accepting them. The unsent-prompt marker
+	// literally means the opposite. Only sawActiveAfterSend below is
+	// submission evidence, and conflating the two is what let this function
+	// return deliverySubmitted for a message still sitting in a composer:
+	// the exact phantom success of issue #1793, on the Claude path.
 	sawDeliveryEvidence := false
+	// sawUnsentMarker records that the composer was positively observed
+	// HOLDING this message at some point. Combined with the composer being
+	// clear at the end of the budget (checked below), held-then-cleared is
+	// genuine submission evidence: the agent took the message out of the
+	// composer. Body text merely being visible is not the same thing and must
+	// not be treated as if it were.
+	sawUnsentMarker := false
 	// Snippet of the message body to look for in captured pane content. Some
 	// TUI frameworks (and non-Claude tools) won't render a "[Pasted text …]"
 	// or "❯ <msg>" marker, so direct verbatim content is the only signal.
 	// Take the first run of non-whitespace content, capped, to avoid false
 	// positives from matching common short strings.
 	deliveryToken := messageDeliveryToken(message)
+	// attrib is the #1777 attribution gate. EVERY bare Enter in this loop —
+	// including the unsent-prompt branch, which used to press unconditionally
+	// whenever a "[Pasted text …]" marker appeared anywhere in the pane —
+	// goes through attrib.NudgeEnter, so no branch can submit composer
+	// content agent-deck cannot attribute to its own delivery.
+	attrib := send.EnterAttribution{
+		Message:        message,
+		OwnPasteMarker: opts.composerPasteFreeBeforeSend,
+	}
 	for retry := 0; retry < opts.maxRetries; retry++ {
 		time.Sleep(opts.checkDelay)
 
 		unsentPromptDetected := false
-		if rawContent, captureErr := target.CapturePaneFresh(); captureErr == nil {
-			content := tmux.StripANSI(rawContent)
+		// paneNow is this iteration's observation (raw ANSI + whether the
+		// capture succeeded at all), and is what the attribution gate reads.
+		captured, captureErr := target.CapturePaneFresh()
+		paneNow := send.CaptureOutcome(captured, captureErr)
+		if paneNow.OK {
+			content := tmux.StripANSI(captured)
 			unsentPromptDetected = send.HasUnsentPastedPrompt(content) || send.HasUnsentComposerPrompt(content, message)
 			if !sawDeliveryEvidence && deliveryToken != "" && strings.Contains(content, deliveryToken) {
 				sawDeliveryEvidence = true
@@ -2774,10 +3472,11 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 
 		if unsentPromptDetected {
 			sawDeliveryEvidence = true
+			sawUnsentMarker = true
 			waitingNoMarkerChecks = 0
 			waitingNoActivityChecks = 0
 			activeChecks = 0
-			_ = target.SendEnter()
+			attrib.NudgeEnter(target, paneNow, tmux.StripANSI)
 			continue
 		}
 
@@ -2809,10 +3508,33 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 				// visible but the input handler wasn't ready, so sent keys were
 				// discarded. Clear stale input and re-send the full message.
 				if waitingNoActivityChecks >= fullResendThreshold && fullResendCount < maxFullResends {
+					// The resend types the message and presses Enter, so it
+					// submits whatever the composer still holds. Ctrl+C is
+					// meant to empty it first — but a failed Ctrl+C, or one
+					// the agent ignored, would leave foreign content to be
+					// submitted with our payload appended (#1777). Re-read
+					// the pane and skip the resend unless the composer is
+					// verifiably clear of content we cannot attribute.
+					//
+					// fullResendCount and waitingNoActivityChecks are consumed
+					// below, ONLY once a resend is actually about to fire —
+					// not here. Either abort path (Ctrl+C error, or a pane
+					// that still reads as foreign after it) sends nothing, so
+					// charging the finite resend budget or resetting the
+					// waiting-check counter here would burn a scarce slot for
+					// no send and force a fresh fullResendThreshold wait
+					// before the next attempt, right after Ctrl+C may have
+					// already wiped the composer (#1778 review finding 3).
+					if ctrlCErr := target.SendCtrlC(); ctrlCErr != nil {
+						continue
+					}
+					time.Sleep(200 * time.Millisecond)
+					if attrib.EnterWouldSubmitForeignDraft(
+						send.CaptureOutcome(target.CapturePaneFresh()), tmux.StripANSI) {
+						continue
+					}
 					fullResendCount++
 					waitingNoActivityChecks = 0
-					_ = target.SendCtrlC()
-					time.Sleep(200 * time.Millisecond)
 					// A successful resend is not yet evidence of receipt — the
 					// next iteration must still observe a positive signal — so
 					// we intentionally do NOT set sawDeliveryEvidence here, even
@@ -2828,7 +3550,7 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 				// retries) then every 2nd iteration. This addresses bracketed
 				// paste timing failures that are most likely early on.
 				if retry < 5 || retry%2 == 0 {
-					_ = target.SendEnter()
+					attrib.NudgeEnter(target, paneNow, tmux.StripANSI)
 				}
 			}
 			continue
@@ -2840,7 +3562,7 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 		// Increased from 2 to 4 because some TUI frameworks take longer
 		// to process and reflect state.
 		if retry < 4 {
-			_ = target.SendEnter()
+			attrib.NudgeEnter(target, paneNow, tmux.StripANSI)
 		}
 	}
 
@@ -2868,9 +3590,26 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 				"and the message body was not visible in the pane. Verify the inner agent is reading from "+
 				"its TTY before retrying", opts.maxRetries)
 		}
-		// Evidence was observed and the composer no longer holds the message:
-		// it was accepted at some point during the budget.
-		return deliverySubmitted, nil
+		if sawActiveAfterSend {
+			// The agent went active after the send: it took the message up.
+			return deliverySubmitted, nil
+		}
+		if sawUnsentMarker {
+			// The composer was observed holding this message and — per the
+			// typed_not_submitted check just above, which did not fire — is
+			// no longer holding it. Held-then-cleared means the agent took it
+			// out of the composer, which is submission.
+			return deliverySubmitted, nil
+		}
+		// The only thing ever observed was the body being visible somewhere in
+		// the pane. That proves the bytes arrived and proves nothing about the
+		// agent accepting them: the Enter can still have been swallowed. Do
+		// not promote arrival to submission — that promotion IS issue #1793.
+		return deliveryTyped, fmt.Errorf(
+			"message reached the pane but submission was never confirmed after %d checks (issue #1793): "+
+				"the body was visible but the agent never began processing it and the composer was never "+
+				"observed taking it. Treat this as NOT delivered — the submitting Enter may have been "+
+				"swallowed", opts.maxRetries)
 	}
 
 	// Legacy best-effort contract for paths that gate verification elsewhere.
@@ -2881,6 +3620,239 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 // suitable for "did this body appear in the pane?" verification. Returns "" if
 // the message contains no usefully-distinctive token (e.g. all whitespace, or
 // only short common words).
+// arrivalVerifyChecks bounds the post-send content-arrival poll. The body
+// echoes into the pane as fast as the agent redraws, so this only has to
+// cover a redraw, not a reply: at the callers' 200ms checkDelay that is ~2s.
+const arrivalVerifyChecks = 10
+
+// arrivalSafeLineBytes is the longest LINE that no line discipline can lose,
+// and therefore the threshold above which an unconfirmed send is a failure
+// rather than an "unverified" shrug. Same figure the tmux transport treats as
+// always-safe (internal/tmux canonicalSafeBytes): at or below it the
+// canonical-overflow loss mode of issue #1793 cannot occur, so a missed pane
+// match is far likelier to be a rendering quirk than a lost message and the
+// historical best-effort contract is kept. Above it a missed match is the
+// actual bug signature and must not be reported as success.
+//
+// Measured per LINE, deliberately. Gating on total payload size would fail a
+// 20 KB body of short lines that the transport in this same change delivers
+// without trouble.
+const arrivalSafeLineBytes = 1023
+
+// sendArrivalBaseline is the pre-send state the arrival check measures change
+// against. Every field here is meaningless on its own and meaningful only as a
+// delta (see the comment at the capture site).
+type sendArrivalBaseline struct {
+	// occurrences is how many copies of the message body were already
+	// visible in the pane before the send.
+	occurrences int
+	// paneOK reports that the pre-send capture actually succeeded. When it
+	// did not there is NO baseline, and the content signal must be switched
+	// off rather than defaulted to zero: a failed look would otherwise make
+	// a pre-existing copy of a repeated message read as a new arrival.
+	paneOK bool
+	// wasActive reports whether the agent was already working before the
+	// send, in which case "it is active now" proves nothing.
+	wasActive bool
+	// statusOK reports that the pre-send status read succeeded. Same reason:
+	// a failed read defaulting to "was not active" would turn a
+	// continuously-busy agent into a fake not-active-to-active transition.
+	statusOK bool
+}
+
+// captureArrivalBaseline snapshots the pane and status before a send. Each
+// signal records whether it was actually observed; a signal without a valid
+// baseline is disabled, never guessed.
+func captureArrivalBaseline(target sendRetryTarget, message string) sendArrivalBaseline {
+	base := sendArrivalBaseline{}
+	if n, ok := countMessageInPane(target, message); ok {
+		base.occurrences, base.paneOK = n, true
+	}
+	if status, err := target.GetStatus(); err == nil {
+		base.wasActive, base.statusOK = status == "active", true
+	}
+	return base
+}
+
+// verifyContentArrival confirms that message reached the target pane, for
+// tools whose TUI exposes no Claude-shaped submit signal (issue #1793).
+//
+// Evidence is a TRANSITION from the pre-send baseline, never a snapshot:
+// either a new copy of the body appearing in the pane, or the agent going
+// active when it was not active before the send — an idle agent that starts
+// working necessarily received what it started working on. An agent that was
+// already busy stays busy regardless, so that case proves nothing and is not
+// accepted.
+//
+// The two signals are not equal in strength, and the result says which one
+// was found. An idle agent going active is attributable to this send, so that
+// is deliverySubmitted. The body appearing is only deliveryTyped: bytes in a
+// composer are not an accepted turn — Enter can still have been swallowed,
+// which is the failure #1413 and #1793 are both about.
+//
+// The pane comparison is whitespace-insensitive because a pane wraps long
+// lines at its width and capture-pane returns those wraps as newlines, so a
+// byte-exact search for a 64-character token fails on any message wider than
+// the remaining columns. Stripping whitespace from both sides restores the
+// contiguity the terminal broke.
+//
+// A signal whose pre-send baseline could not be read is switched OFF, not
+// defaulted: without a baseline there is no transition to measure, and
+// guessing one is how a failed capture would quietly become fake evidence.
+func verifyContentArrival(target sendRetryTarget, message string, opts sendRetryOptions, baseline sendArrivalBaseline) (string, error) {
+	// Whether an unverified outcome is a failure depends on the longest LINE,
+	// not on the total payload. Canonical buffering is per line — that is the
+	// whole finding this fix rests on — so a 20 KB body of 80-byte lines is
+	// as deliverable as a one-liner, and failing it for its total size would
+	// contradict the transport in the same commit.
+	//
+	// The comparison is against the pane's own capacity where that can be
+	// measured, and only against the universal floor when it cannot. The
+	// floor is what EVERY pane can take, not what THIS pane can take: a
+	// raw-mode pane has no line limit at all, so judging it by the floor
+	// would condemn perfectly deliverable sends.
+	longestLine := longestMessageLineBytes(message)
+	riskyLine := false
+	if longestLine > arrivalSafeLineBytes {
+		riskyLine = longestLine > maxDeliverableLineBytes(target)
+	}
+
+	token := collapseWhitespace(messageDeliveryToken(message))
+	if token == "" {
+		// Nothing distinctive enough to look for. Verification is impossible
+		// rather than failed — but "impossible" must not become an exit 0 for
+		// a payload with a line big enough to be silently eaten, which would
+		// leave the reported bug wide open through the token-less door.
+		if riskyLine {
+			return deliveryNoEvidence, fmt.Errorf(
+				"send could not be verified: this message has a %d-byte line, long enough that a "+
+					"canonical-mode reader can discard it along with the submitting Enter, and it carries no "+
+					"content distinctive enough to look for in the pane (issue #1793). Refusing to report "+
+					"success for a send nothing can confirm",
+				longestLine)
+		}
+		return deliveryUnverified, nil
+	}
+
+	checks := opts.maxRetries
+	if checks > arrivalVerifyChecks {
+		checks = arrivalVerifyChecks
+	}
+	if checks < 1 {
+		checks = 1
+	}
+
+	sawBody := false
+	for i := 0; i < checks; i++ {
+		// Strongest signal first: an idle agent that starts working received
+		// what it started working on, which is submission, not just arrival.
+		if baseline.statusOK && !baseline.wasActive {
+			if status, err := target.GetStatus(); err == nil && status == "active" {
+				return deliverySubmitted, nil
+			}
+		}
+		if baseline.paneOK {
+			if n, ok := countMessageInPane(target, message); ok && n > baseline.occurrences {
+				// Keep polling: the body is in, but the turn may still start
+				// within the budget and upgrade this to submitted.
+				sawBody = true
+			}
+		}
+		if i < checks-1 {
+			time.Sleep(opts.checkDelay)
+		}
+	}
+
+	if sawBody {
+		// The bytes demonstrably reached the pane and nothing showed the
+		// agent taking them up. This is NOT a success: text sitting unsent in
+		// a composer is precisely the state issue #1793 reported as a false
+		// success, and returning nil here would hand the caller exit 0 and
+		// `"success": true` next to `"submitted": false`. Fail, so scripts and
+		// agents cannot read it as delivered.
+		return deliveryTyped, fmt.Errorf(
+			"message reached the pane but submission was never confirmed after %d checks (issue #1793): "+
+				"the body is visible but the agent never began processing it. Treat this as NOT delivered — "+
+				"the submitting Enter may have been swallowed", checks)
+	}
+
+	if riskyLine {
+		return deliveryNoEvidence, fmt.Errorf(
+			"send could not be confirmed: a message with a %d-byte line never appeared in the pane and the "+
+				"agent showed no new activity after %d checks (issue #1793). A line that long is discarded "+
+				"outright — together with the submitting Enter — by a canonical-mode reader, so this is "+
+				"reported as a failure rather than as an unverified success",
+			longestLine, checks)
+	}
+	return deliveryUnverified, nil
+}
+
+// longestMessageLineBytes is the length of the longest line of message.
+// Mirrors the quantity the tmux transport measures, because the terminal
+// limit this whole fix is about is per line, not per payload. Both \n and \r
+// end a line: with ICRNL set (the tty default) an incoming CR becomes NL
+// before the line discipline sees it, so counting only \n would read a
+// CR-delimited body as one enormous line.
+func longestMessageLineBytes(message string) int {
+	longest := 0
+	for _, line := range strings.FieldsFunc(message, func(r rune) bool {
+		return r == '\n' || r == '\r'
+	}) {
+		if len(line) > longest {
+			longest = len(line)
+		}
+	}
+	return longest
+}
+
+// paneLineCapacityReporter is implemented by *tmux.Session. It is an optional
+// capability, discovered by type assertion, so the interface sendRetryTarget
+// stays small and existing fakes keep working: a target that cannot report a
+// capacity simply falls back to the universal floor.
+type paneLineCapacityReporter interface {
+	PaneLineCapacity() (int, bool)
+}
+
+// maxDeliverableLineBytes returns the longest single line this target can
+// accept. It prefers the pane's DETECTED capacity — a raw-mode pane has no
+// line limit and a Linux canonical pane holds four times what the floor
+// assumes — and only falls back to arrivalSafeLineBytes when the pane cannot
+// be probed. Without this, a 2000-byte line that delivers perfectly to any
+// raw-mode agent TUI would be reported as lost purely because 2000 > 1023.
+//
+// Only consulted when a line already exceeds the floor, so ordinary sends
+// never pay for the probe.
+func maxDeliverableLineBytes(target sendRetryTarget) int {
+	if reporter, ok := target.(paneLineCapacityReporter); ok {
+		if capacity, known := reporter.PaneLineCapacity(); known && capacity > 0 {
+			return capacity
+		}
+	}
+	return arrivalSafeLineBytes
+}
+
+// countMessageInPane reports how many times the message's distinctive token
+// appears in the pane right now. The bool reports whether the pane was
+// actually read: a failed look is not "zero occurrences", it is no
+// observation at all, and callers must not treat the two the same.
+func countMessageInPane(target sendRetryTarget, message string) (int, bool) {
+	token := collapseWhitespace(messageDeliveryToken(message))
+	if token == "" {
+		return 0, false
+	}
+	raw, err := target.CapturePaneFresh()
+	if err != nil {
+		return 0, false
+	}
+	return strings.Count(collapseWhitespace(tmux.StripANSI(raw)), token), true
+}
+
+// collapseWhitespace removes every whitespace byte, so a comparison survives
+// the line wrapping a terminal applies to long content.
+func collapseWhitespace(s string) string {
+	return strings.Join(strings.Fields(s), "")
+}
+
 func messageDeliveryToken(message string) string {
 	const minTokenLen = 12
 	const maxTokenLen = 64
@@ -3129,6 +4101,8 @@ func streamSessionSend(inst *session.Instance, sessionRef, profile string, sentA
 	if session.IsClaudeCompatible(inst.Tool) {
 		if fresh := inst.GetSessionIDFromTmux(); fresh != "" {
 			inst.ClaudeSessionID = fresh
+			// #1815: own pane env — weak vouch.
+			session.NoteClaudeSessionIDFromOwnPane(inst)
 			inst.ClaudeDetectedAt = time.Now()
 		}
 	}
@@ -3240,6 +4214,8 @@ func handleSessionOutput(profile string, args []string) {
 	if session.IsClaudeCompatible(inst.Tool) {
 		if freshID := inst.GetSessionIDFromTmux(); freshID != "" {
 			inst.ClaudeSessionID = freshID
+			// #1815: own pane env — weak vouch.
+			session.NoteClaudeSessionIDFromOwnPane(inst)
 			inst.ClaudeDetectedAt = time.Now()
 		}
 	}
@@ -3385,10 +4361,22 @@ func handleSessionCurrent(profileArg string, args []string) {
 		os.Exit(1)
 	}
 
-	// Detect profile: use explicit arg if provided, otherwise auto-detect
+	// Detect profile: use explicit arg if provided, otherwise auto-detect.
+	// #1790/#1822: route the auto-detect path through ResolveProfileForStorage,
+	// not the bare GetEffectiveProfile(""). The
+	// result below is handed straight to findInstanceDataByTmuxFast, which
+	// opens/creates storage for it (NewStorageWithProfile) — a bare
+	// GetEffectiveProfile result would look like an explicit -p selection to
+	// that call's own guard, bypassing it a second hop downstream, the same
+	// class of bug fixed at the other call sites.
 	detectedProfile := profileArg
 	if detectedProfile == "" || detectedProfile == session.DefaultProfile {
-		detectedProfile = profile.DetectCurrentProfile()
+		resolved, err := session.ResolveProfileForStorage("")
+		if err != nil {
+			out.Error(fmt.Sprintf("failed to resolve profile: %v", err), ErrCodeNotFound)
+			os.Exit(1)
+		}
+		detectedProfile = resolved
 	}
 
 	// Try fast path: LoadLite + match by tmux session name
@@ -3448,8 +4436,8 @@ func handleSessionCurrent(profileArg string, args []string) {
 
 // getCurrentTmuxSessionName gets the current tmux session name (single subprocess call)
 func getCurrentTmuxSessionName() (string, error) {
-	cmd := exec.Command("tmux", "display-message", "-p", "#{session_name}")
-	output, err := cmd.Output()
+	// Bounded — see tmuxProbeTimeout.
+	output, err := tmuxProbeBounded("display-message", "-p", "#{session_name}")
 	if err != nil {
 		return "", err
 	}
@@ -3538,6 +4526,10 @@ func handleSessionChildren(profile string, args []string) {
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
+	follow := fs.Bool("follow", false, "Stream child state changes as JSONL (one event per line) until interrupted")
+	interval := fs.Duration("interval", 2*time.Second, "Poll interval for --follow")
+	heartbeat := fs.Duration("heartbeat", 60*time.Second, "Heartbeat event interval for --follow (0 disables)")
+	untilDone := fs.Bool("until-done", false, "With --follow: exit 0 once every child is terminal (done sentinel, error, or stopped)")
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck session children [id|title] [options]")
 		fmt.Println()
@@ -3546,6 +4538,15 @@ func handleSessionChildren(profile string, args []string) {
 		fmt.Println()
 		fmt.Println("Options:")
 		fs.PrintDefaults()
+		fmt.Println()
+		fmt.Println("--follow emits JSONL events: snapshot (initial state per child), added,")
+		fmt.Println("status (from/to transition), done (completion sentinel), removed, error,")
+		fmt.Println("plus periodic heartbeat and a final complete line with --until-done.")
+		fmt.Println()
+		fmt.Println("Examples:")
+		fmt.Println("  agent-deck session children --json")
+		fmt.Println("  agent-deck session children --follow                    # live fleet event stream")
+		fmt.Println("  agent-deck session children --follow --until-done      # exits when all children finish")
 	}
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
@@ -3576,36 +4577,34 @@ func handleSessionChildren(profile string, args []string) {
 		os.Exit(2)
 	}
 
+	if *untilDone && !*follow {
+		out.Error("--until-done requires --follow", ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	// A non-positive interval makes time.Sleep a no-op, turning the poll into a
+	// busy-loop that reopens storage every pass. Reject rather than clamp: a
+	// silently different interval than asked for is its own surprise.
+	if *follow && *interval <= 0 {
+		out.Error("--interval must be positive", ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	if *follow {
+		// The stream is JSONL by contract; --json/-q are irrelevant here.
+		os.Exit(runChildrenFollow(profile, parent.ID, *interval, *heartbeat, *untilDone, os.Stdout))
+	}
+
 	kids := childrenOf(parent.ID, instances)
 	session.RefreshInstancesForCLIStatus(kids)
 
-	type childRow struct {
-		ID          string `json:"id"`
-		Title       string `json:"title"`
-		Status      string `json:"status"`
-		DoneStatus  string `json:"done_status,omitempty"`
-		DoneSummary string `json:"done_summary,omitempty"`
-		DoneAt      string `json:"done_at,omitempty"`
-	}
-	rows := make([]childRow, 0, len(kids))
+	rows := buildChildRows(kids)
 	var human strings.Builder
 	fmt.Fprintf(&human, "Children of %s (%s):\n", parent.Title, parent.ID)
-	for _, k := range kids {
-		_ = k.UpdateStatus()
-		row := childRow{ID: k.ID, Title: k.Title, Status: StatusString(k.Status)}
-		if e, ok := session.ReadLedgerEntry(k.ID); ok {
-			row.DoneStatus = e.Status
-			row.DoneSummary = e.Summary
-			if !e.FinishedAt.IsZero() {
-				row.DoneAt = e.FinishedAt.Format(time.RFC3339)
-			}
-		}
-		rows = append(rows, row)
+	for _, row := range rows {
 		done := row.DoneStatus
 		if done == "" {
 			done = "-"
 		}
-		fmt.Fprintf(&human, "  %s  %-20s  %-8s  done=%s  %s\n", k.ID, k.Title, row.Status, done, row.DoneSummary)
+		fmt.Fprintf(&human, "  %s  %-20s  %-8s  done=%s  %s\n", row.ID, row.Title, row.Status, done, row.DoneSummary)
 	}
 	if len(kids) == 0 {
 		human.WriteString("  (no sub-sessions)\n")

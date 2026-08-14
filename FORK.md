@@ -51,7 +51,7 @@ from main's checkout each run. Changes to them must be pushed to BOTH `custom/de
 `/.github/workflows/ci.yml` (fork-only) builds and tests pushes/PRs to `main`,
 `custom/dev`, and `feature/*`.
 
-## Patch inventory (as of v1.10.7 + 2)
+## Patch inventory (as of v1.11.0 merge)
 
 Grouped by feature. "Upstream?" = candidate for submitting upstream; every patch
 upstreamed is permanent merge burden removed.
@@ -71,6 +71,7 @@ upstreamed is permanent merge burden removed.
 | Fork validation helper (`sessionFileFoundButEmpty`) | `4642d8f8` | No, fork test support |
 | Termius emoji-wide row clamping (terminalDrawWidth) | `ba1b4243` | No, Termius-specific; upstream uses ansi.StringWidth |
 | Repo hygiene (.beads gitignore, fork CI files) | `5aa3b339`, `74e70078` | No, fork-only |
+| Pin `go-runewidth` to v0.0.24 via `replace` (v0.0.27's `initStrictWidthLUT()` costs ~31ms at package init, tripping the TestPerf_ColdStart 40ms budget) | v1.11.0 merge | No, fork perf guard; re-check each upstream merge in case upstream bumps it again or go-runewidth fixes the init |
 
 Integration-noise commits (`95912e58`, `48cbeb04`, `a2a3e5b8`, `ca3b1bcd`) are
 leftovers from the rebase era; merge-based tracking stops producing these.

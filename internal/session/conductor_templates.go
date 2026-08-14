@@ -30,6 +30,7 @@ Each conductor has its own identity in its subdirectory and its own policy in PO
 | ` + "`" + `agent-deck -p <PROFILE> session send <id_or_title> "message"` + "`" + ` | Send a message. Has built-in 60s wait for agent readiness. |
 | ` + "`" + `agent-deck -p <PROFILE> session send <id_or_title> "message" --wait -q --timeout 300s` + "`" + ` | Single-call send + wait + raw output (preferred when you need the reply now). |
 | ` + "`" + `agent-deck -p <PROFILE> session send <id_or_title> "message" --no-wait` + "`" + ` | Send immediately without waiting for ready state. |
+| ` + "`" + `agent-deck -p <PROFILE> session approve <id_or_title> [once|always|session|N]` + "`" + ` | Resolve a visible Codex approval prompt with one keypress. Never use ` + "`" + `session send "1"` + "`" + ` for Codex approvals. |
 
 ### Session Control
 | Command | Description |
@@ -51,7 +52,9 @@ Commands accept: **exact title**, **ID prefix** (e.g., first 4 chars), **path**,
 | ` + "`" + `running` + "`" + ` (green) | The conductor is actively processing | Do nothing. Wait. |
 | ` + "`" + `waiting` + "`" + ` (yellow) | The conductor finished and needs input | Read output, decide: auto-respond or escalate |
 | ` + "`" + `idle` + "`" + ` (gray) | Waiting, but user acknowledged | User knows about it. Skip unless asked. |
-| ` + "`" + `error` + "`" + ` (red) | Session crashed or missing | Try ` + "`" + `session restart` + "`" + `. If that fails, escalate. |
+| ` + "`" + `error` + "`" + ` (red) | Crashed, missing, or wedged (auth/model failure) | Check the substate first. Then try ` + "`" + `session restart` + "`" + `; if that fails, escalate. |
+
+**Substate (Claude sessions only; refines status in ` + "`" + `list` + "`" + `/` + "`" + `show` + "`" + ` JSON):** ` + "`" + `auth-401` + "`" + ` covers two different pane banners. A credential banner (` + "`" + `Please run /login` + "`" + `, ` + "`" + `API Error: 401` + "`" + `) means the fleet is HOLDING the session; restarting will NOT fix it. Check ` + "`" + `session show --json <id>` + "`" + ` for the ` + "`" + `auth_hold` + "`" + ` object (the authoritative source, present even after the pane exits) and escalate for re-login. A dropped-socket banner (` + "`" + `socket connection closed` + "`" + `) also classifies as ` + "`" + `auth-401` + "`" + ` but is NOT held and IS restart-recoverable: restart it. ` + "`" + `model-unavailable` + "`" + ` means the selected model is down (shows as error, not running); self-heal currently only observes this and takes no action, so switch it yourself with ` + "`" + `agent-deck -p <PROFILE> session set <id> model <model>` + "`" + ` then ` + "`" + `agent-deck -p <PROFILE> session restart <id>` + "`" + `. ` + "`" + `idle-at-empty-prompt` + "`" + ` (shown as coarse status ` + "`" + `idle` + "`" + ` or ` + "`" + `waiting` + "`" + `) means the session is genuinely sitting at its prompt with nothing happening. Never restart-loop an ` + "`" + `error` + "`" + ` session that ` + "`" + `auth_hold` + "`" + ` confirms is credential-held.
 
 ## Heartbeat Protocol
 
@@ -202,6 +205,7 @@ If the bridge cannot resolve a name (temporary API failure), the raw Slack ID ap
 - Keep parent linkage for event routing; if you need a specific group, pass ` + "`" + `-g <group>` + "`" + ` explicitly (it overrides inherited parent group).
 - Transition notifications are parent-linked. If ` + "`" + `parent_session_id` + "`" + ` is empty or points elsewhere, this conductor will not receive child completion events.
 - ` + "`" + `session send` + "`" + ` waits up to ~80 seconds for the agent to be ready. If the session is running (busy), the send will wait.
+- When a Codex child shows a numbered approval menu, use ` + "`" + `session approve <id> <choice>` + "`" + `. A digit sent through ` + "`" + `session send` + "`" + ` is composer text plus Enter and can interrupt the resumed turn.
 - For periodic nudges/heartbeats where blocking is harmful, prefer ` + "`" + `session send --no-wait -q` + "`" + `.
 - Remote channels send with ` + "`" + `session send --wait -q` + "`" + ` and wait in a single CLI call. Reply promptly.
 - Your own session can be restarted by the bridge if it detects you're in an error state.

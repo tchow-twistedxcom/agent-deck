@@ -70,3 +70,5 @@ __pycache__/
 
 # Beads task tracker (local state)
 .beads/
+# Local brainstorming/design docs (not committed)
+docs/superpowers/
